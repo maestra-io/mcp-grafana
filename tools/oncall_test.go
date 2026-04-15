@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	aapi "github.com/grafana/amixr-api-go-client"
@@ -14,12 +15,16 @@ import (
 )
 
 func TestOncallClientFromContext_TokenPriority(t *testing.T) {
-	// capturedAuthHeader records the Authorization header from the last request.
+	// mu protects capturedAuthHeader from concurrent access between
+	// the httptest handler goroutine and the test goroutine.
+	var mu sync.Mutex
 	var capturedAuthHeader string
 
 	// Fake OnCall API that captures the Authorization header.
 	oncallServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		capturedAuthHeader = r.Header.Get("Authorization")
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"count":0,"next":null,"previous":null,"results":[]}`))
 	}))
@@ -38,7 +43,10 @@ func TestOncallClientFromContext_TokenPriority(t *testing.T) {
 	defer grafanaServer.Close()
 
 	t.Run("uses OnCallToken when set", func(t *testing.T) {
+		mu.Lock()
 		capturedAuthHeader = ""
+		mu.Unlock()
+
 		config := mcpgrafana.GrafanaConfig{
 			URL:         grafanaServer.URL,
 			APIKey:      "sa-token",
@@ -53,11 +61,17 @@ func TestOncallClientFromContext_TokenPriority(t *testing.T) {
 		_, _, err = svc.ListAlertGroups(&aapi.ListAlertGroupOptions{})
 		require.NoError(t, err)
 
-		assert.Equal(t, "personal-oncall-token", capturedAuthHeader)
+		mu.Lock()
+		got := capturedAuthHeader
+		mu.Unlock()
+		assert.Equal(t, "personal-oncall-token", got)
 	})
 
 	t.Run("falls back to APIKey when OnCallToken is empty", func(t *testing.T) {
+		mu.Lock()
 		capturedAuthHeader = ""
+		mu.Unlock()
+
 		config := mcpgrafana.GrafanaConfig{
 			URL:         grafanaServer.URL,
 			APIKey:      "sa-token",
@@ -71,6 +85,9 @@ func TestOncallClientFromContext_TokenPriority(t *testing.T) {
 		_, _, err = svc.ListAlertGroups(&aapi.ListAlertGroupOptions{})
 		require.NoError(t, err)
 
-		assert.Equal(t, "sa-token", capturedAuthHeader)
+		mu.Lock()
+		got := capturedAuthHeader
+		mu.Unlock()
+		assert.Equal(t, "sa-token", got)
 	})
 }
