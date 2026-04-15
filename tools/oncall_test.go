@@ -10,7 +10,6 @@ import (
 
 	aapi "github.com/grafana/amixr-api-go-client"
 	mcpgrafana "github.com/grafana/mcp-grafana"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -122,7 +121,7 @@ func TestOncallClientFromContext_BothTokensEmpty(t *testing.T) {
 
 	_, err := oncallClientFromContext(ctx)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no OnCall authentication token")
+	require.Contains(t, err.Error(), "no OnCall authentication token")
 }
 
 func TestOncallClientFromContext_WhitespaceOnCallToken(t *testing.T) {
