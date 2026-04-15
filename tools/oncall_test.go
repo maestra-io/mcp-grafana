@@ -14,13 +14,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestOncallClientFromContext_TokenPriority(t *testing.T) {
-	// mu protects capturedAuthHeader from concurrent access between
-	// the httptest handler goroutine and the test goroutine.
+// newTestServers creates a fake OnCall API server and a fake Grafana server.
+// The OnCall server captures the Authorization header from each request.
+// The Grafana server returns the OnCall URL from the IRM plugin settings.
+// Returns the servers, a mutex-protected getter for the captured header, and a cleanup func.
+func newTestServers(t *testing.T) (grafanaURL string, getAuthHeader func() string) {
+	t.Helper()
+
 	var mu sync.Mutex
 	var capturedAuthHeader string
 
-	// Fake OnCall API that captures the Authorization header.
 	oncallServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		capturedAuthHeader = r.Header.Get("Authorization")
@@ -28,9 +31,8 @@ func TestOncallClientFromContext_TokenPriority(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"count":0,"next":null,"previous":null,"results":[]}`))
 	}))
-	defer oncallServer.Close()
+	t.Cleanup(oncallServer.Close)
 
-	// Fake Grafana that returns the OnCall URL from the IRM plugin settings.
 	grafanaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		resp := map[string]interface{}{
@@ -40,54 +42,104 @@ func TestOncallClientFromContext_TokenPriority(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
-	defer grafanaServer.Close()
+	t.Cleanup(grafanaServer.Close)
 
-	t.Run("uses OnCallToken when set", func(t *testing.T) {
+	getAuthHeader = func() string {
 		mu.Lock()
-		capturedAuthHeader = ""
-		mu.Unlock()
+		defer mu.Unlock()
+		return capturedAuthHeader
+	}
 
-		config := mcpgrafana.GrafanaConfig{
-			URL:         grafanaServer.URL,
-			APIKey:      "sa-token",
-			OnCallToken: "personal-oncall-token",
-		}
-		ctx := mcpgrafana.WithGrafanaConfig(context.Background(), config)
+	return grafanaServer.URL, getAuthHeader
+}
 
-		svc, err := getAlertGroupServiceFromContext(ctx)
-		require.NoError(t, err)
+func TestOncallClientFromContext_UsesOnCallTokenWhenSet(t *testing.T) {
+	grafanaURL, getAuthHeader := newTestServers(t)
 
-		// Make a request so the token gets sent.
-		_, _, err = svc.ListAlertGroups(&aapi.ListAlertGroupOptions{})
-		require.NoError(t, err)
+	config := mcpgrafana.GrafanaConfig{
+		URL:         grafanaURL,
+		APIKey:      "sa-token",
+		OnCallToken: "personal-oncall-token",
+	}
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), config)
 
-		mu.Lock()
-		got := capturedAuthHeader
-		mu.Unlock()
-		assert.Equal(t, "personal-oncall-token", got)
-	})
+	svc, err := getAlertGroupServiceFromContext(ctx)
+	require.NoError(t, err)
 
-	t.Run("falls back to APIKey when OnCallToken is empty", func(t *testing.T) {
-		mu.Lock()
-		capturedAuthHeader = ""
-		mu.Unlock()
+	_, _, err = svc.ListAlertGroups(&aapi.ListAlertGroupOptions{})
+	require.NoError(t, err)
 
-		config := mcpgrafana.GrafanaConfig{
-			URL:         grafanaServer.URL,
-			APIKey:      "sa-token",
-			OnCallToken: "",
-		}
-		ctx := mcpgrafana.WithGrafanaConfig(context.Background(), config)
+	require.Equal(t, "personal-oncall-token", getAuthHeader())
+}
 
-		svc, err := getAlertGroupServiceFromContext(ctx)
-		require.NoError(t, err)
+func TestOncallClientFromContext_FallsBackToAPIKey(t *testing.T) {
+	grafanaURL, getAuthHeader := newTestServers(t)
 
-		_, _, err = svc.ListAlertGroups(&aapi.ListAlertGroupOptions{})
-		require.NoError(t, err)
+	config := mcpgrafana.GrafanaConfig{
+		URL:         grafanaURL,
+		APIKey:      "sa-token",
+		OnCallToken: "",
+	}
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), config)
 
-		mu.Lock()
-		got := capturedAuthHeader
-		mu.Unlock()
-		assert.Equal(t, "sa-token", got)
-	})
+	svc, err := getAlertGroupServiceFromContext(ctx)
+	require.NoError(t, err)
+
+	_, _, err = svc.ListAlertGroups(&aapi.ListAlertGroupOptions{})
+	require.NoError(t, err)
+
+	require.Equal(t, "sa-token", getAuthHeader())
+}
+
+func TestOncallClientFromContext_OnCallTokenSetAPIKeyEmpty(t *testing.T) {
+	grafanaURL, getAuthHeader := newTestServers(t)
+
+	config := mcpgrafana.GrafanaConfig{
+		URL:         grafanaURL,
+		APIKey:      "",
+		OnCallToken: "personal-oncall-token",
+	}
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), config)
+
+	svc, err := getAlertGroupServiceFromContext(ctx)
+	require.NoError(t, err)
+
+	_, _, err = svc.ListAlertGroups(&aapi.ListAlertGroupOptions{})
+	require.NoError(t, err)
+
+	require.Equal(t, "personal-oncall-token", getAuthHeader())
+}
+
+func TestOncallClientFromContext_BothTokensEmpty(t *testing.T) {
+	grafanaURL, _ := newTestServers(t)
+
+	config := mcpgrafana.GrafanaConfig{
+		URL:         grafanaURL,
+		APIKey:      "",
+		OnCallToken: "",
+	}
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), config)
+
+	_, err := oncallClientFromContext(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no authentication token configured for OnCall")
+}
+
+func TestOncallClientFromContext_WhitespaceOnCallToken(t *testing.T) {
+	grafanaURL, _ := newTestServers(t)
+
+	// Whitespace-only token is not empty string, so our code treats it as "set"
+	// and does NOT fall back to APIKey. The amixr HTTP client trims headers,
+	// so the actual Authorization header will be empty — but the important
+	// thing is that we don't fall back to the SA token.
+	config := mcpgrafana.GrafanaConfig{
+		URL:         grafanaURL,
+		APIKey:      "sa-token",
+		OnCallToken: "   ",
+	}
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), config)
+
+	// Client creation should succeed (validation happens server-side).
+	_, err := oncallClientFromContext(ctx)
+	require.NoError(t, err)
 }

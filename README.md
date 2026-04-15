@@ -142,6 +142,9 @@ The dashboard tools now include several strategies to manage context window usag
 - **List teams and users:** View all OnCall teams and users.
 - **List alert groups:** View and filter alert groups from Grafana OnCall by various criteria including state, integration, labels, and time range.
 - **Get alert group details:** Retrieve detailed information about a specific alert group by its ID.
+- **Manage alert groups:** Acknowledge, unacknowledge, resolve, silence, and unsilence alert groups.
+
+> **Note:** Mutating OnCall actions (acknowledge, resolve, silence) require a **personal API token** — service account tokens are rejected by the OnCall API for these operations. Set `GRAFANA_ONCALL_TOKEN` to a personal token created in IRM → Settings → API Tokens. A `GRAFANA_SERVICE_ACCOUNT_TOKEN` is still required for reading OnCall plugin settings. If `GRAFANA_ONCALL_TOKEN` is not set, the server falls back to `GRAFANA_SERVICE_ACCOUNT_TOKEN` for all OnCall operations.
 
 ### Admin
 

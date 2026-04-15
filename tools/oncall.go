@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -92,6 +93,12 @@ func oncallClientFromContext(ctx context.Context) (*aapi.Client, error) {
 	token := cfg.OnCallToken
 	if token == "" {
 		token = cfg.APIKey
+		if token != "" {
+			slog.Debug("GRAFANA_ONCALL_TOKEN not set, falling back to service account token for OnCall API; mutating actions (acknowledge, resolve, silence) may fail")
+		}
+	}
+	if token == "" {
+		return nil, fmt.Errorf("no authentication token configured for OnCall: set GRAFANA_ONCALL_TOKEN or GRAFANA_SERVICE_ACCOUNT_TOKEN")
 	}
 	client, err := aapi.NewWithGrafanaURL(grafanaOnCallURL, token, cfg.URL)
 	if err != nil {

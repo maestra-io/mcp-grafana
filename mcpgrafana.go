@@ -39,9 +39,8 @@ const (
 	grafanaAPIEnvVar                 = "GRAFANA_API_KEY" // Deprecated: use GRAFANA_SERVICE_ACCOUNT_TOKEN instead
 	grafanaOrgIDEnvVar               = "GRAFANA_ORG_ID"
 
-	grafanaUsernameEnvVar = "GRAFANA_USERNAME"
-	grafanaPasswordEnvVar = "GRAFANA_PASSWORD"
-
+	grafanaUsernameEnvVar    = "GRAFANA_USERNAME"
+	grafanaPasswordEnvVar    = "GRAFANA_PASSWORD"
 	grafanaOnCallTokenEnvVar = "GRAFANA_ONCALL_TOKEN"
 
 	grafanaExtraHeadersEnvVar   = "GRAFANA_EXTRA_HEADERS"
@@ -50,6 +49,7 @@ const (
 	grafanaURLHeader                 = "X-Grafana-URL"
 	grafanaServiceAccountTokenHeader = "X-Grafana-Service-Account-Token"
 	grafanaAPIKeyHeader              = "X-Grafana-API-Key" // Deprecated: use X-Grafana-Service-Account-Token instead
+	grafanaOnCallTokenHeader         = "X-Grafana-OnCall-Token"
 )
 
 func urlAndAPIKeyFromEnv() (string, string) {
@@ -80,6 +80,14 @@ func userAndPassFromEnv() *url.Userinfo {
 		return url.User(username)
 	}
 	return url.UserPassword(username, password)
+}
+
+func onCallTokenFromEnv() string {
+	return os.Getenv(grafanaOnCallTokenEnvVar)
+}
+
+func onCallTokenFromHeaders(req *http.Request) string {
+	return req.Header.Get(grafanaOnCallTokenHeader)
 }
 
 func orgIdFromEnv() int64 {
@@ -228,6 +236,13 @@ type GrafanaConfig struct {
 	// It may be empty if we are using on-behalf-of auth.
 	APIKey string
 
+	// OnCallToken is a personal API token for Grafana OnCall.
+	// Service account tokens cannot perform mutating actions (acknowledge, resolve, silence)
+	// in OnCall, so a personal token from IRM → Settings → API Tokens is required.
+	// Set via GRAFANA_ONCALL_TOKEN or X-Grafana-OnCall-Token header.
+	// The OnCall client falls back to APIKey when this is empty.
+	OnCallToken string
+
 	// Credentials if user is using basic auth
 	BasicAuth *url.Userinfo
 
@@ -250,12 +265,6 @@ type GrafanaConfig struct {
 	// A Timeout of zero means no timeout.
 	// Default is 10 seconds.
 	Timeout time.Duration
-
-	// OnCallToken is a personal API token for Grafana OnCall.
-	// Service account tokens cannot perform mutating actions (acknowledge, resolve, silence)
-	// in OnCall, so a personal token from IRM → Settings → API Tokens is required.
-	// Set via GRAFANA_ONCALL_TOKEN. Falls back to APIKey if not set.
-	OnCallToken string
 
 	// ExtraHeaders contains additional HTTP headers to send with all Grafana API requests.
 	// Parsed from GRAFANA_EXTRA_HEADERS environment variable as JSON object.
@@ -538,17 +547,18 @@ var ExtractGrafanaInfoFromEnv server.StdioContextFunc = func(ctx context.Context
 	}
 
 	extraHeaders := extraHeadersFromEnv()
-	slog.Info("Using Grafana configuration", "url", parsedURL.Redacted(), "api_key_set", apiKey != "", "basic_auth_set", basicAuth != nil, "org_id", orgID, "extra_headers_count", len(extraHeaders))
+	onCallToken := onCallTokenFromEnv()
+	slog.Info("Using Grafana configuration", "url", parsedURL.Redacted(), "api_key_set", apiKey != "", "basic_auth_set", basicAuth != nil, "oncall_token_set", onCallToken != "", "org_id", orgID, "extra_headers_count", len(extraHeaders))
 
 	// Get existing config or create a new one.
 	// This will respect the existing debug flag, if set.
 	config := GrafanaConfigFromContext(ctx)
 	config.URL = u
 	config.APIKey = apiKey
+	config.OnCallToken = onCallToken
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
 	config.ExtraHeaders = extraHeaders
-	config.OnCallToken = os.Getenv(grafanaOnCallTokenEnvVar)
 	return WithGrafanaConfig(ctx, config)
 }
 
@@ -563,15 +573,21 @@ type httpContextFunc func(ctx context.Context, req *http.Request) context.Contex
 var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, req *http.Request) context.Context {
 	u, apiKey, basicAuth, orgID := extractKeyGrafanaInfoFromReq(req)
 
+	// OnCall token: prefer header, fall back to env.
+	onCallToken := onCallTokenFromHeaders(req)
+	if onCallToken == "" {
+		onCallToken = onCallTokenFromEnv()
+	}
+
 	// Get existing config or create a new one.
 	// This will respect the existing debug flag, if set.
 	config := GrafanaConfigFromContext(ctx)
 	config.URL = u
 	config.APIKey = apiKey
+	config.OnCallToken = onCallToken
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
 	config.ExtraHeaders = mergeHeaders(extraHeadersFromEnv(), forwardedHeadersFromRequest(req))
-	config.OnCallToken = os.Getenv(grafanaOnCallTokenEnvVar)
 	return WithGrafanaConfig(ctx, config)
 }
 
