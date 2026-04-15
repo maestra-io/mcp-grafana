@@ -535,6 +535,9 @@ func alertGroupAction(ctx context.Context, alertGroupID, action string) (*aapi.A
 	if err != nil {
 		return nil, fmt.Errorf("%s alert group %s: %w", action, alertGroupID, err)
 	}
+	if alertGroup == nil {
+		return nil, fmt.Errorf("%s alert group %s: empty response body", action, alertGroupID)
+	}
 
 	return alertGroup, nil
 }
