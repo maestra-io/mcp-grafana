@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
@@ -509,6 +510,97 @@ var GetAlertGroup = mcpgrafana.MustTool(
 	mcp.WithReadOnlyHintAnnotation(true),
 )
 
+// alertGroupAction performs a POST action on an alert group (resolve, acknowledge, etc.).
+// The amixr-api-go-client library doesn't expose these action methods, so we call the API directly.
+func alertGroupAction(ctx context.Context, alertGroupID, action string) (*aapi.AlertGroup, error) {
+	alertGroupID = strings.TrimSpace(alertGroupID)
+	if alertGroupID == "" {
+		return nil, fmt.Errorf("alertGroupId is required")
+	}
+
+	client, err := oncallClientFromContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getting OnCall client: %w", err)
+	}
+
+	escapedID := url.PathEscape(alertGroupID)
+	path := fmt.Sprintf("alert_groups/%s/%s/", escapedID, action)
+	req, err := client.NewRequest("POST", path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating %s request: %w", action, err)
+	}
+
+	var alertGroup *aapi.AlertGroup
+	_, err = client.Do(req, &alertGroup)
+	if err != nil {
+		return nil, fmt.Errorf("%s alert group %s: %w", action, alertGroupID, err)
+	}
+	if alertGroup == nil {
+		return nil, fmt.Errorf("%s alert group %s: empty response body", action, alertGroupID)
+	}
+
+	return alertGroup, nil
+}
+
+type AlertGroupActionParams struct {
+	AlertGroupID string `json:"alertGroupId" jsonschema:"required,description=The ID of the alert group to perform the action on"`
+}
+
+func acknowledgeAlertGroup(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
+	return alertGroupAction(ctx, args.AlertGroupID, "acknowledge")
+}
+
+var AcknowledgeAlertGroup = mcpgrafana.MustTool(
+	"acknowledge_alert_group",
+	"Acknowledge a specific Grafana OnCall alert group by its ID. Changes the alert group state to 'acknowledged'. Returns the updated alert group.",
+	acknowledgeAlertGroup,
+	mcp.WithTitleAnnotation("Acknowledge alert group"),
+)
+
+func unacknowledgeAlertGroup(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
+	return alertGroupAction(ctx, args.AlertGroupID, "unacknowledge")
+}
+
+var UnacknowledgeAlertGroup = mcpgrafana.MustTool(
+	"unacknowledge_alert_group",
+	"Unacknowledge a specific Grafana OnCall alert group by its ID. Reverts the alert group state from 'acknowledged' back to 'new'. Returns the updated alert group.",
+	unacknowledgeAlertGroup,
+	mcp.WithTitleAnnotation("Unacknowledge alert group"),
+)
+
+func resolveAlertGroup(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
+	return alertGroupAction(ctx, args.AlertGroupID, "resolve")
+}
+
+var ResolveAlertGroup = mcpgrafana.MustTool(
+	"resolve_alert_group",
+	"Resolve a specific Grafana OnCall alert group by its ID. Changes the alert group state to 'resolved'. Returns the updated alert group.",
+	resolveAlertGroup,
+	mcp.WithTitleAnnotation("Resolve alert group"),
+)
+
+func silenceAlertGroup(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
+	return alertGroupAction(ctx, args.AlertGroupID, "silence")
+}
+
+var SilenceAlertGroup = mcpgrafana.MustTool(
+	"silence_alert_group",
+	"Silence a specific Grafana OnCall alert group by its ID. Changes the alert group state to 'silenced'. Returns the updated alert group.",
+	silenceAlertGroup,
+	mcp.WithTitleAnnotation("Silence alert group"),
+)
+
+func unsilenceAlertGroup(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
+	return alertGroupAction(ctx, args.AlertGroupID, "unsilence")
+}
+
+var UnsilenceAlertGroup = mcpgrafana.MustTool(
+	"unsilence_alert_group",
+	"Unsilence a specific Grafana OnCall alert group by its ID. Reverts the alert group state from 'silenced'. Returns the updated alert group.",
+	unsilenceAlertGroup,
+	mcp.WithTitleAnnotation("Unsilence alert group"),
+)
+
 func AddOnCallTools(mcp *server.MCPServer) {
 	ListOnCallSchedules.Register(mcp)
 	GetOnCallShift.Register(mcp)
@@ -517,4 +609,9 @@ func AddOnCallTools(mcp *server.MCPServer) {
 	ListOnCallUsers.Register(mcp)
 	ListAlertGroups.Register(mcp)
 	GetAlertGroup.Register(mcp)
+	AcknowledgeAlertGroup.Register(mcp)
+	UnacknowledgeAlertGroup.Register(mcp)
+	ResolveAlertGroup.Register(mcp)
+	SilenceAlertGroup.Register(mcp)
+	UnsilenceAlertGroup.Register(mcp)
 }
