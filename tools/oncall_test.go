@@ -16,7 +16,7 @@ import (
 // newTestServers creates a fake OnCall API server and a fake Grafana server.
 // The OnCall server captures the Authorization header from each request.
 // The Grafana server returns the OnCall URL from the IRM plugin settings.
-// Returns the servers, a mutex-protected getter for the captured header, and a cleanup func.
+// Returns the Grafana server URL and a mutex-protected getter for the captured auth header.
 func newTestServers(t *testing.T) (grafanaURL string, getAuthHeader func() string) {
 	t.Helper()
 
