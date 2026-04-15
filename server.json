@@ -45,6 +45,13 @@
           "name": "GRAFANA_PASSWORD"
         },
         {
+          "description": "Personal API token for Grafana OnCall (IRM)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true,
+          "name": "GRAFANA_ONCALL_TOKEN"
+        },
+        {
           "description": "Organization ID for multi-org support. Can also be set via X-Grafana-Org-Id header in SSE/streamable HTTP transports.",
           "isRequired": false,
           "format": "string",
