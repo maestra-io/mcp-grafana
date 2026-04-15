@@ -50,7 +50,8 @@ func TestOncallClientFromContext_TokenPriority(t *testing.T) {
 		require.NoError(t, err)
 
 		// Make a request so the token gets sent.
-		_, _, _ = svc.ListAlertGroups(&aapi.ListAlertGroupOptions{})
+		_, _, err = svc.ListAlertGroups(&aapi.ListAlertGroupOptions{})
+		require.NoError(t, err)
 
 		assert.Equal(t, "personal-oncall-token", capturedAuthHeader)
 	})
@@ -67,7 +68,8 @@ func TestOncallClientFromContext_TokenPriority(t *testing.T) {
 		svc, err := getAlertGroupServiceFromContext(ctx)
 		require.NoError(t, err)
 
-		_, _, _ = svc.ListAlertGroups(&aapi.ListAlertGroupOptions{})
+		_, _, err = svc.ListAlertGroups(&aapi.ListAlertGroupOptions{})
+		require.NoError(t, err)
 
 		assert.Equal(t, "sa-token", capturedAuthHeader)
 	})
