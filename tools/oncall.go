@@ -513,7 +513,8 @@ var GetAlertGroup = mcpgrafana.MustTool(
 // alertGroupAction performs a POST action on an alert group (resolve, acknowledge, etc.).
 // The amixr-api-go-client library doesn't expose these action methods, so we call the API directly.
 func alertGroupAction(ctx context.Context, alertGroupID, action string) (*aapi.AlertGroup, error) {
-	if strings.TrimSpace(alertGroupID) == "" {
+	alertGroupID = strings.TrimSpace(alertGroupID)
+	if alertGroupID == "" {
 		return nil, fmt.Errorf("alertGroupId is required")
 	}
 
