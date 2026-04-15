@@ -69,10 +69,8 @@ jobs:
           EOF_TBOT
 
           mkdir -p /tmp/tbot-output
-          tbot start -c /tmp/tbot.yaml || true
-          test -f /tmp/tbot-output/jwt_svid
+          tbot start -c /tmp/tbot.yaml
 
-          pip install -q awscli
           export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/tbot-output/jwt_svid
           export AWS_ROLE_ARN="${{ env.AWS_ROLE_ARN }}"
           export AWS_DEFAULT_REGION=${{ env.AWS_REGION }}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
@@ -512,12 +513,17 @@ var GetAlertGroup = mcpgrafana.MustTool(
 // alertGroupAction performs a POST action on an alert group (resolve, acknowledge, etc.).
 // The amixr-api-go-client library doesn't expose these action methods, so we call the API directly.
 func alertGroupAction(ctx context.Context, alertGroupID, action string) (*aapi.AlertGroup, error) {
+	if strings.TrimSpace(alertGroupID) == "" {
+		return nil, fmt.Errorf("alertGroupId is required")
+	}
+
 	client, err := oncallClientFromContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getting OnCall client: %w", err)
 	}
 
-	path := fmt.Sprintf("alert_groups/%s/%s/", alertGroupID, action)
+	escapedID := url.PathEscape(alertGroupID)
+	path := fmt.Sprintf("alert_groups/%s/%s/", escapedID, action)
 	req, err := client.NewRequest("POST", path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating %s request: %w", action, err)
