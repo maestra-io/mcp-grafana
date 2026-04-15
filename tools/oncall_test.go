@@ -128,9 +128,8 @@ func TestOncallClientFromContext_WhitespaceOnCallToken(t *testing.T) {
 	grafanaURL, _ := newTestServers(t)
 
 	// Whitespace-only token is not empty string, so our code treats it as "set"
-	// and does NOT fall back to APIKey. The amixr HTTP client trims headers,
-	// so the actual Authorization header will be empty — but the important
-	// thing is that we don't fall back to the SA token.
+	// and does NOT fall back to APIKey. The whitespace token will be sent as-is
+	// in the Authorization header and rejected by the OnCall API at runtime.
 	config := mcpgrafana.GrafanaConfig{
 		URL:         grafanaURL,
 		APIKey:      "sa-token",
