@@ -189,6 +189,8 @@ github.com/grafana/amixr-api-go-client v0.0.28 h1:wh4aeEFVVJPv68YpxJAoP03BTUkLk6
 github.com/grafana/amixr-api-go-client v0.0.28/go.mod h1:hU0Hq74HITX7RfcP0uZ7+F0/L+TL3N6JSzofBm2vzco=
 github.com/grafana/grafana-openapi-client-go v0.0.0-20260330113218-ee77c4f6f90e h1:P/SerquhsX/4a3kreHR5mrJmohlWRqaxei/ZUSA6zkA=
 github.com/grafana/grafana-openapi-client-go v0.0.0-20260330113218-ee77c4f6f90e/go.mod h1:sMcpxegie6TcvI6eVm+MbNneNC249GGWRcEO1M+UfSE=
+github.com/grafana/grafana-openapi-client-go v0.0.0-20260414120814-5b95bb183fae h1:ExiJ4Ha24+MRuKxymlGp5bAJwbUSHe+QXcf6E8pwlo0=
+github.com/grafana/grafana-openapi-client-go v0.0.0-20260414120814-5b95bb183fae/go.mod h1:4WkWL9W7QMnRgRA1XrrSbZRg/UIoTx4x5ynx5RjJldU=
 github.com/grafana/grafana-plugin-sdk-go v0.290.1 h1:wNX4R8sHxEAmtmFhmV05IsLGznzdMKvN94v+2Pz8Wkw=
 github.com/grafana/grafana-plugin-sdk-go v0.290.1/go.mod h1:KDkcxp1XqbKz0WD/q9p98Cf5Wp50LG0NkoPlVlptSWs=
 github.com/grafana/incident-go v0.0.0-20251003115753-d71681611ddd h1:y8uJA/UmFHjwNWAvppxDRq+w9zIQmb0z79YVV2vS96g=
