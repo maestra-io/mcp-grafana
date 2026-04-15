@@ -42,6 +42,8 @@ const (
 	grafanaUsernameEnvVar = "GRAFANA_USERNAME"
 	grafanaPasswordEnvVar = "GRAFANA_PASSWORD"
 
+	grafanaOnCallTokenEnvVar = "GRAFANA_ONCALL_TOKEN"
+
 	grafanaExtraHeadersEnvVar   = "GRAFANA_EXTRA_HEADERS"
 	grafanaForwardHeadersEnvVar = "GRAFANA_FORWARD_HEADERS"
 
@@ -248,6 +250,12 @@ type GrafanaConfig struct {
 	// A Timeout of zero means no timeout.
 	// Default is 10 seconds.
 	Timeout time.Duration
+
+	// OnCallToken is a personal API token for Grafana OnCall.
+	// Service account tokens cannot perform mutating actions (acknowledge, resolve, silence)
+	// in OnCall, so a personal token from IRM → Settings → API Tokens is required.
+	// Set via GRAFANA_ONCALL_TOKEN. Falls back to APIKey if not set.
+	OnCallToken string
 
 	// ExtraHeaders contains additional HTTP headers to send with all Grafana API requests.
 	// Parsed from GRAFANA_EXTRA_HEADERS environment variable as JSON object.
@@ -540,6 +548,7 @@ var ExtractGrafanaInfoFromEnv server.StdioContextFunc = func(ctx context.Context
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
 	config.ExtraHeaders = extraHeaders
+	config.OnCallToken = os.Getenv(grafanaOnCallTokenEnvVar)
 	return WithGrafanaConfig(ctx, config)
 }
 
@@ -562,6 +571,7 @@ var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, re
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
 	config.ExtraHeaders = mergeHeaders(extraHeadersFromEnv(), forwardedHeadersFromRequest(req))
+	config.OnCallToken = os.Getenv(grafanaOnCallTokenEnvVar)
 	return WithGrafanaConfig(ctx, config)
 }
 

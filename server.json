@@ -45,6 +45,13 @@
           "name": "GRAFANA_PASSWORD"
         },
         {
+          "description": "Personal API token for Grafana OnCall. Required for mutating actions (acknowledge, resolve, silence) because service account tokens are not allowed to perform these. Create one in IRM → Settings → API Tokens. Falls back to GRAFANA_SERVICE_ACCOUNT_TOKEN if not set.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true,
+          "name": "GRAFANA_ONCALL_TOKEN"
+        },
+        {
           "description": "Organization ID for multi-org support. Can also be set via X-Grafana-Org-Id header in SSE/streamable HTTP transports.",
           "isRequired": false,
           "format": "string",

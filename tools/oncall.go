@@ -85,8 +85,15 @@ func oncallClientFromContext(ctx context.Context) (*aapi.Client, error) {
 
 	grafanaOnCallURL = strings.TrimRight(grafanaOnCallURL, "/")
 
-	// TODO: Allow access to OnCall using an access token instead of an API key.
-	client, err := aapi.NewWithGrafanaURL(grafanaOnCallURL, cfg.APIKey, cfg.URL)
+	// Use the dedicated OnCall personal token if set, otherwise fall back to the
+	// service account token. Personal tokens are required for mutating actions
+	// (acknowledge, resolve, silence) because Grafana OnCall rejects those from
+	// service accounts.
+	token := cfg.OnCallToken
+	if token == "" {
+		token = cfg.APIKey
+	}
+	client, err := aapi.NewWithGrafanaURL(grafanaOnCallURL, token, cfg.URL)
 	if err != nil {
 		return nil, fmt.Errorf("creating OnCall client: %w", err)
 	}

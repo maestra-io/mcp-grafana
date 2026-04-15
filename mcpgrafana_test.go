@@ -76,6 +76,28 @@ func TestExtractIncidentClientFromHeaders(t *testing.T) {
 	})
 }
 
+func TestExtractGrafanaInfoFromEnv(t *testing.T) {
+	t.Run("oncall token from env", func(t *testing.T) {
+		t.Setenv("GRAFANA_ONCALL_TOKEN", "my-personal-oncall-token")
+		t.Setenv("GRAFANA_URL", "http://localhost:3000")
+		t.Setenv("GRAFANA_SERVICE_ACCOUNT_TOKEN", "sa-token")
+
+		ctx := ExtractGrafanaInfoFromEnv(context.Background())
+		config := GrafanaConfigFromContext(ctx)
+		assert.Equal(t, "my-personal-oncall-token", config.OnCallToken)
+		assert.Equal(t, "sa-token", config.APIKey)
+	})
+
+	t.Run("oncall token empty when not set", func(t *testing.T) {
+		t.Setenv("GRAFANA_ONCALL_TOKEN", "")
+		t.Setenv("GRAFANA_URL", "http://localhost:3000")
+
+		ctx := ExtractGrafanaInfoFromEnv(context.Background())
+		config := GrafanaConfigFromContext(ctx)
+		assert.Empty(t, config.OnCallToken)
+	})
+}
+
 func TestExtractGrafanaInfoFromHeaders(t *testing.T) {
 	t.Run("no headers, no env", func(t *testing.T) {
 		// Explicitly clear environment variables to ensure test isolation
@@ -272,6 +294,26 @@ func TestExtractGrafanaInfoFromHeaders(t *testing.T) {
 		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
 		config := GrafanaConfigFromContext(ctx)
 		assert.Equal(t, int64(0), config.OrgID)
+	})
+
+	t.Run("oncall token from env", func(t *testing.T) {
+		t.Setenv("GRAFANA_ONCALL_TOKEN", "my-oncall-token")
+
+		req, err := http.NewRequest("GET", "http://example.com", nil)
+		require.NoError(t, err)
+		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
+		config := GrafanaConfigFromContext(ctx)
+		assert.Equal(t, "my-oncall-token", config.OnCallToken)
+	})
+
+	t.Run("oncall token empty when not set", func(t *testing.T) {
+		t.Setenv("GRAFANA_ONCALL_TOKEN", "")
+
+		req, err := http.NewRequest("GET", "http://example.com", nil)
+		require.NoError(t, err)
+		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
+		config := GrafanaConfigFromContext(ctx)
+		assert.Empty(t, config.OnCallToken)
 	})
 }
 
