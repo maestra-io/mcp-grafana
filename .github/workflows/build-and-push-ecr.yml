@@ -1,0 +1,103 @@
+name: Build and Push to ECR
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  packages: read
+
+env:
+  ECR_REGISTRY: 515260921971.dkr.ecr.eu-central-1.amazonaws.com
+  AWS_REGION: eu-central-1
+  TELEPORT_FQDN: teleport.maestra.io:443
+  TELEPORT_TOKEN: image-push-github-actions-mcp-grafana
+  AWS_ROLE_ARN: "arn:aws:iam::515260921971:role/teleport-image-push"
+  IMAGE_NAME: mcp-grafana
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_BUILDKIT: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get Teleport version
+        id: tp-version
+        run: |
+          VERSION=$(curl -sf "https://${{ env.TELEPORT_FQDN }}/webapi/find" | jq -r '.auto_update.tools_version // .server_version')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Teleport binaries
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.tool_cache }}/teleport
+          key: teleport-${{ steps.tp-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install Teleport
+        uses: teleport-actions/setup@v1
+        with:
+          version: ${{ steps.tp-version.outputs.version }}
+          proxy: ${{ env.TELEPORT_FQDN }}
+
+      - name: ECR login via Teleport Workload Identity
+        run: |
+          cat > /tmp/tbot.yaml << EOF_TBOT
+          version: v2
+          proxy_server: ${{ env.TELEPORT_FQDN }}
+          onboarding:
+            join_method: github
+            token: ${{ env.TELEPORT_TOKEN }}
+          oneshot: true
+          storage:
+            type: memory
+          services:
+            - type: workload-identity-jwt
+              destination:
+                type: directory
+                path: /tmp/tbot-output
+              selector:
+                name: image-push
+              audiences: ["sts.amazonaws.com"]
+          EOF_TBOT
+
+          mkdir -p /tmp/tbot-output
+          tbot start -c /tmp/tbot.yaml || true
+          test -f /tmp/tbot-output/jwt_svid
+
+          pip install -q awscli
+          export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/tbot-output/jwt_svid
+          export AWS_ROLE_ARN="${{ env.AWS_ROLE_ARN }}"
+          export AWS_DEFAULT_REGION=${{ env.AWS_REGION }}
+
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login ${{ env.ECR_REGISTRY }} --username AWS --password-stdin
+
+          aws ecr describe-repositories --repository-names ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} 2>/dev/null || \
+          aws ecr create-repository --repository-name ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Generate release number
+        id: release-number
+        uses: mindbox-moscow/gha-release-number@master
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        run: |
+          TAG=${{ steps.release-number.outputs.release-number }}
+          docker build -t ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG .
+          docker tag ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Create GitHub release
+        uses: mindbox-moscow/github-actions/create-github-release@master
+        with:
+          release-number: ${{ steps.release-number.outputs.release-number }}
