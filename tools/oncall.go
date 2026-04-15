@@ -94,11 +94,12 @@ func oncallClientFromContext(ctx context.Context) (*aapi.Client, error) {
 	if token == "" {
 		token = cfg.APIKey
 		if token != "" {
-			slog.Debug("GRAFANA_ONCALL_TOKEN not set, falling back to service account token for OnCall API; mutating actions (acknowledge, resolve, silence) may fail")
+			slog.Debug("Using service account token for OnCall API",
+				"hint", "set GRAFANA_ONCALL_TOKEN for mutating actions (acknowledge, resolve, silence)")
 		}
 	}
 	if token == "" {
-		return nil, fmt.Errorf("no authentication token configured for OnCall: set GRAFANA_ONCALL_TOKEN or GRAFANA_SERVICE_ACCOUNT_TOKEN")
+		return nil, fmt.Errorf("no OnCall authentication token: set GRAFANA_ONCALL_TOKEN or GRAFANA_SERVICE_ACCOUNT_TOKEN")
 	}
 	client, err := aapi.NewWithGrafanaURL(grafanaOnCallURL, token, cfg.URL)
 	if err != nil {
@@ -328,7 +329,7 @@ func getCurrentOnCallUsers(ctx context.Context, args GetCurrentOnCallUsersParams
 		user, _, err := userService.GetUser(userID, &aapi.GetUserOptions{})
 		if err != nil {
 			// Log the error but continue with other users
-			fmt.Printf("Error fetching user %s: %v\n", userID, err)
+			slog.Warn("Failed to fetch OnCall user", "user_id", userID, "error", err)
 			continue
 		}
 		result.Users = append(result.Users, user)

@@ -122,7 +122,7 @@ func TestOncallClientFromContext_BothTokensEmpty(t *testing.T) {
 
 	_, err := oncallClientFromContext(ctx)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no authentication token configured for OnCall")
+	assert.Contains(t, err.Error(), "no OnCall authentication token")
 }
 
 func TestOncallClientFromContext_WhitespaceOnCallToken(t *testing.T) {

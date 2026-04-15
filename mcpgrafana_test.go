@@ -98,19 +98,6 @@ func TestExtractGrafanaInfoFromEnv(t *testing.T) {
 		config := GrafanaConfigFromContext(ctx)
 		assert.Empty(t, config.OnCallToken)
 	})
-
-	t.Run("oncall token independent of api key", func(t *testing.T) {
-		t.Setenv("GRAFANA_ONCALL_TOKEN", "oncall-token")
-		t.Setenv("GRAFANA_URL", "http://localhost:3000")
-		t.Setenv("GRAFANA_SERVICE_ACCOUNT_TOKEN", "sa-token")
-
-		ctx := ExtractGrafanaInfoFromEnv(context.Background())
-		config := GrafanaConfigFromContext(ctx)
-		// Verify both tokens are stored independently
-		assert.Equal(t, "oncall-token", config.OnCallToken)
-		assert.Equal(t, "sa-token", config.APIKey)
-		assert.NotEqual(t, config.OnCallToken, config.APIKey)
-	})
 }
 
 func TestExtractGrafanaInfoFromHeaders(t *testing.T) {
@@ -322,17 +309,6 @@ func TestExtractGrafanaInfoFromHeaders(t *testing.T) {
 		assert.Equal(t, "my-oncall-token", config.OnCallToken)
 	})
 
-	t.Run("oncall token from header", func(t *testing.T) {
-		t.Setenv("GRAFANA_ONCALL_TOKEN", "env-oncall-token")
-
-		req, err := http.NewRequest("GET", "http://example.com", nil)
-		require.NoError(t, err)
-		req.Header.Set("X-Grafana-OnCall-Token", "header-oncall-token")
-		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
-		config := GrafanaConfigFromContext(ctx)
-		assert.Equal(t, "header-oncall-token", config.OnCallToken)
-	})
-
 	t.Run("oncall token header takes precedence over env", func(t *testing.T) {
 		t.Setenv("GRAFANA_ONCALL_TOKEN", "env-token")
 
@@ -344,7 +320,18 @@ func TestExtractGrafanaInfoFromHeaders(t *testing.T) {
 		assert.Equal(t, "header-token", config.OnCallToken)
 	})
 
-	t.Run("oncall token falls back to env when header empty", func(t *testing.T) {
+	t.Run("oncall token from header when env empty", func(t *testing.T) {
+		t.Setenv("GRAFANA_ONCALL_TOKEN", "")
+
+		req, err := http.NewRequest("GET", "http://example.com", nil)
+		require.NoError(t, err)
+		req.Header.Set("X-Grafana-OnCall-Token", "header-oncall-token")
+		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
+		config := GrafanaConfigFromContext(ctx)
+		assert.Equal(t, "header-oncall-token", config.OnCallToken)
+	})
+
+	t.Run("oncall token falls back to env when no header", func(t *testing.T) {
 		t.Setenv("GRAFANA_ONCALL_TOKEN", "env-oncall-token")
 
 		req, err := http.NewRequest("GET", "http://example.com", nil)

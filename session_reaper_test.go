@@ -73,11 +73,13 @@ func TestSessionManager_ReaperCleansUpProxiedClients(t *testing.T) {
 	sm.mutex.RLock()
 	state := sm.sessions["cleanup-session"]
 	sm.mutex.RUnlock()
+	state.mutex.Lock()
 	state.proxiedClients["tempo_test-uid"] = &ProxiedClient{
 		DatasourceUID:  "test-uid",
 		DatasourceName: "Test",
 		DatasourceType: "tempo",
 	}
+	state.mutex.Unlock()
 
 	// Wait for reaper
 	time.Sleep(500 * time.Millisecond)

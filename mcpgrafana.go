@@ -37,11 +37,11 @@ const (
 	grafanaURLEnvVar                 = "GRAFANA_URL"
 	grafanaServiceAccountTokenEnvVar = "GRAFANA_SERVICE_ACCOUNT_TOKEN"
 	grafanaAPIEnvVar                 = "GRAFANA_API_KEY" // Deprecated: use GRAFANA_SERVICE_ACCOUNT_TOKEN instead
+	grafanaOnCallTokenEnvVar         = "GRAFANA_ONCALL_TOKEN"
 	grafanaOrgIDEnvVar               = "GRAFANA_ORG_ID"
 
-	grafanaUsernameEnvVar    = "GRAFANA_USERNAME"
-	grafanaPasswordEnvVar    = "GRAFANA_PASSWORD"
-	grafanaOnCallTokenEnvVar = "GRAFANA_ONCALL_TOKEN"
+	grafanaUsernameEnvVar = "GRAFANA_USERNAME"
+	grafanaPasswordEnvVar = "GRAFANA_PASSWORD"
 
 	grafanaExtraHeadersEnvVar   = "GRAFANA_EXTRA_HEADERS"
 	grafanaForwardHeadersEnvVar = "GRAFANA_FORWARD_HEADERS"
@@ -538,7 +538,9 @@ func extractKeyGrafanaInfoFromReq(req *http.Request) (grafanaUrl, apiKey string,
 }
 
 // ExtractGrafanaInfoFromEnv is a StdioContextFunc that extracts Grafana configuration from environment variables.
-// It reads GRAFANA_URL and GRAFANA_SERVICE_ACCOUNT_TOKEN (or deprecated GRAFANA_API_KEY) environment variables and adds the configuration to the context for use by Grafana clients.
+// It reads GRAFANA_URL, GRAFANA_SERVICE_ACCOUNT_TOKEN (or deprecated GRAFANA_API_KEY), GRAFANA_ONCALL_TOKEN,
+// GRAFANA_USERNAME/PASSWORD, GRAFANA_ORG_ID, and GRAFANA_EXTRA_HEADERS environment variables
+// and adds the configuration to the context for use by Grafana clients.
 var ExtractGrafanaInfoFromEnv server.StdioContextFunc = func(ctx context.Context) context.Context {
 	u, apiKey, basicAuth, orgID := extractKeyGrafanaInfoFromEnv()
 	parsedURL, err := url.Parse(u)
@@ -568,7 +570,8 @@ var ExtractGrafanaInfoFromEnv server.StdioContextFunc = func(ctx context.Context
 type httpContextFunc func(ctx context.Context, req *http.Request) context.Context
 
 // ExtractGrafanaInfoFromHeaders is a HTTPContextFunc that extracts Grafana configuration from HTTP request headers.
-// It reads X-Grafana-URL and X-Grafana-API-Key headers, falling back to environment variables if headers are not present.
+// It reads X-Grafana-URL, X-Grafana-Service-Account-Token (or deprecated X-Grafana-API-Key), and
+// X-Grafana-OnCall-Token headers, falling back to environment variables if headers are not present.
 // Headers listed in GRAFANA_FORWARD_HEADERS are copied from the incoming request and merged with GRAFANA_EXTRA_HEADERS.
 var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, req *http.Request) context.Context {
 	u, apiKey, basicAuth, orgID := extractKeyGrafanaInfoFromReq(req)
