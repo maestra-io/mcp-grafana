@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -563,14 +564,16 @@ func TestResolveOutputFormat(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{name: "nil → default", input: nil, want: OutputFormatImage},
-		{name: "empty → default", input: stringPtr(""), want: OutputFormatImage},
-		{name: "whitespace-only → default", input: stringPtr("   "), want: OutputFormatImage},
-		{name: "image literal", input: stringPtr("image"), want: OutputFormatImage},
-		{name: "resource literal", input: stringPtr("resource"), want: OutputFormatResource},
-		{name: "both literal", input: stringPtr("both"), want: OutputFormatBoth},
-		{name: "case-insensitive", input: stringPtr("Resource"), want: OutputFormatResource},
-		{name: "surrounding whitespace", input: stringPtr("  both  "), want: OutputFormatBoth},
+		{name: "nil -> default", input: nil, want: outputFormatImage},
+		{name: "empty -> default", input: stringPtr(""), want: outputFormatImage},
+		{name: "image literal", input: stringPtr("image"), want: outputFormatImage},
+		{name: "resource literal", input: stringPtr("resource"), want: outputFormatResource},
+		{name: "both literal", input: stringPtr("both"), want: outputFormatBoth},
+		// The schema advertises lowercase only; we reject deviations so a
+		// client that validates against the enum sees the same behavior
+		// as the server.
+		{name: "uppercase rejected", input: stringPtr("BOTH"), wantErr: true},
+		{name: "whitespace rejected", input: stringPtr(" both "), wantErr: true},
 		{name: "unknown value errors", input: stringPtr("binary"), wantErr: true},
 	}
 	for _, tt := range tests {
@@ -588,6 +591,11 @@ func TestResolveOutputFormat(t *testing.T) {
 }
 
 func TestBuildRenderResourceURI(t *testing.T) {
+	// Pinned so the test fails loudly if the hashing scheme ever changes
+	// accidentally. Computed as hex.EncodeToString(sha256("payload")[:4]).
+	const payload = "payload"
+	const wantHash = "239f59ed"
+
 	tests := []struct {
 		name string
 		args GetPanelImageParams
@@ -596,24 +604,45 @@ func TestBuildRenderResourceURI(t *testing.T) {
 		{
 			name: "dashboard only",
 			args: GetPanelImageParams{DashboardUID: "abc123"},
-			want: "grafana://render/dashboard/abc123",
+			want: "grafana://render/dashboard/abc123?h=" + wantHash,
 		},
 		{
 			name: "panel included",
 			args: GetPanelImageParams{DashboardUID: "abc123", PanelID: intPtr(7)},
-			want: "grafana://render/dashboard/abc123/panel/7",
+			want: "grafana://render/dashboard/abc123/panel/7?h=" + wantHash,
 		},
 		{
 			name: "uid with special chars is escaped",
 			args: GetPanelImageParams{DashboardUID: "has/slash and space"},
-			want: "grafana://render/dashboard/has%2Fslash%20and%20space",
+			want: "grafana://render/dashboard/has%2Fslash%20and%20space?h=" + wantHash,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, buildRenderResourceURI(tt.args))
+			assert.Equal(t, tt.want, buildRenderResourceURI(tt.args, []byte(payload)))
 		})
 	}
+}
+
+// TestBuildRenderResourceURI_DistinctContentYieldsDistinctURI locks in the
+// dedup-disambiguation contract: two renders of the same dashboard with
+// different pixel bytes must produce different URIs so MCP clients that
+// dedupe by URI don't collapse them into one.
+func TestBuildRenderResourceURI_DistinctContentYieldsDistinctURI(t *testing.T) {
+	args := GetPanelImageParams{DashboardUID: "abc"}
+	uri1 := buildRenderResourceURI(args, []byte("render-1"))
+	uri2 := buildRenderResourceURI(args, []byte("render-2"))
+	assert.NotEqual(t, uri1, uri2, "distinct image bytes must yield distinct URIs")
+}
+
+// TestBuildRenderResourceURI_StableForSameContent locks in the
+// idempotency contract: re-rendering the identical state produces the
+// identical URI, letting well-behaved caches treat it as a cache key.
+func TestBuildRenderResourceURI_StableForSameContent(t *testing.T) {
+	args := GetPanelImageParams{DashboardUID: "abc", PanelID: intPtr(3)}
+	uri1 := buildRenderResourceURI(args, []byte("render-1"))
+	uri2 := buildRenderResourceURI(args, []byte("render-1"))
+	assert.Equal(t, uri1, uri2, "identical image bytes must yield identical URIs")
 }
 
 // TestGetPanelImage_OutputFormats exercises the full HTTP path for each
@@ -656,7 +685,12 @@ func TestGetPanelImage_OutputFormats(t *testing.T) {
 		require.True(t, ok, "resource payload must be BlobResourceContents, got %T", res.Resource)
 		assert.Equal(t, "image/png", blob.MIMEType)
 		assert.Equal(t, wantB64, blob.Blob)
-		assert.Equal(t, "grafana://render/dashboard/test-dash", blob.URI)
+		assert.True(t, strings.HasPrefix(blob.URI, "grafana://render/dashboard/test-dash?h="),
+			"resource URI must be dashboard-scoped with a content hash, got %q", blob.URI)
+		// The resource block should be annotated so context-pruning clients
+		// know it's out-of-band tooling payload, not something to feed the LLM.
+		require.NotNil(t, res.Annotations)
+		assert.Equal(t, []mcp.Role{mcp.RoleUser}, res.Annotations.Audience)
 	}
 
 	assertBoth := func(t *testing.T, result *mcp.CallToolResult) {
@@ -681,11 +715,6 @@ func TestGetPanelImage_OutputFormats(t *testing.T) {
 		{name: "explicit image", format: stringPtr("image"), check: assertImageOnly},
 		{name: "resource only", format: stringPtr("resource"), check: assertResourceOnly},
 		{name: "both", format: stringPtr("both"), check: assertBoth},
-		// Verify normalization without adding a separate HTTP round-trip per
-		// case — these cover the trim/lowercase branches of resolveOutputFormat
-		// *through* the public entry point.
-		{name: "both (uppercase)", format: stringPtr("BOTH"), check: assertBoth},
-		{name: "resource (whitespace)", format: stringPtr("  resource  "), check: assertResourceOnly},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -753,7 +782,8 @@ func TestGetPanelImage_PanelURIIncludesPanelID(t *testing.T) {
 
 	res := result.Content[0].(mcp.EmbeddedResource)
 	blob := res.Resource.(mcp.BlobResourceContents)
-	assert.Equal(t, "grafana://render/dashboard/test-dash/panel/42", blob.URI)
+	assert.True(t, strings.HasPrefix(blob.URI, "grafana://render/dashboard/test-dash/panel/42?h="),
+		"panel-scoped URI must include dashboard UID, panel ID, and content hash, got %q", blob.URI)
 }
 
 // TestGetPanelImage_MIMETypeFromResponse verifies we trust the Content-Type
@@ -770,6 +800,12 @@ func TestGetPanelImage_MIMETypeFromResponse(t *testing.T) {
 		{name: "jpeg passthrough", contentType: "image/jpeg", wantMIME: "image/jpeg"},
 		{name: "missing falls back to png", contentType: "", wantMIME: "image/png"},
 		{name: "non-image falls back to png", contentType: "application/json", wantMIME: "image/png"},
+		// Gateways like Kong/nginx frequently append parameters; the server
+		// must strip them so clients don't see a malformed MIME token.
+		{name: "png with charset param", contentType: "image/png; charset=utf-8", wantMIME: "image/png"},
+		{name: "png with multiple params", contentType: "image/png; charset=binary; boundary=x", wantMIME: "image/png"},
+		{name: "jpeg with spaces and caps", contentType: "IMAGE/JPEG; Quality=85", wantMIME: "image/jpeg"},
+		{name: "malformed header falls back", contentType: "image/;;", wantMIME: "image/png"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -795,6 +831,54 @@ func TestGetPanelImage_MIMETypeFromResponse(t *testing.T) {
 			res := result.Content[1].(mcp.EmbeddedResource)
 			blob := res.Resource.(mcp.BlobResourceContents)
 			assert.Equal(t, tt.wantMIME, blob.MIMEType)
+		})
+	}
+}
+
+// TestGetPanelImage_EmptyBody covers the 200-OK-with-zero-bytes case. A
+// misconfigured image-renderer or a flaky proxy can produce this; we must
+// not silently return an empty-base64 ImageContent because downstream
+// hooks would then write a zero-byte file and treat the render as
+// successful.
+func TestGetPanelImage_EmptyBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.WriteHeader(http.StatusOK)
+		// no body
+	}))
+	defer server.Close()
+
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL:    server.URL,
+		APIKey: "test-api-key",
+	})
+
+	_, err := getPanelImage(ctx, GetPanelImageParams{DashboardUID: "test-dash"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty image body")
+}
+
+// TestParseImageMIME covers the MIME-header normalization function directly,
+// including the cases that would otherwise require spinning up httptest
+// servers to exercise.
+func TestParseImageMIME(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty", in: "", want: "image/png"},
+		{name: "plain png", in: "image/png", want: "image/png"},
+		{name: "plain jpeg", in: "image/jpeg", want: "image/jpeg"},
+		{name: "png with charset", in: "image/png; charset=utf-8", want: "image/png"},
+		{name: "mixed case with params", in: "IMAGE/PNG; Boundary=X", want: "image/png"},
+		{name: "non-image", in: "text/html", want: "image/png"},
+		{name: "garbled", in: "image/;;", want: "image/png"},
+		{name: "application/octet-stream", in: "application/octet-stream", want: "image/png"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, parseImageMIME(tt.in))
 		})
 	}
 }
