@@ -19,6 +19,30 @@ import (
 	mcpgrafana "github.com/grafana/mcp-grafana"
 )
 
+// Supported values for GetPanelImageParams.OutputFormat.
+const (
+	// OutputFormatImage returns a single mcp.ImageContent block. This is the
+	// historical default and works for any client that knows how to display
+	// MCP image content inline.
+	OutputFormatImage = "image"
+	// OutputFormatResource returns a single mcp.EmbeddedResource block wrapping
+	// a BlobResourceContents. Some hosts (notably Claude Code's PostToolUse
+	// hook pipeline) strip the base64 payload out of ImageContent before
+	// forwarding tool results to hooks; resource blobs travel through
+	// untouched, so this format lets downstream scripts reliably reconstruct
+	// the PNG bytes on disk.
+	OutputFormatResource = "resource"
+	// OutputFormatBoth returns the ImageContent (for inline display in the
+	// model's context) and the EmbeddedResource (so hooks/scripts can still
+	// recover the raw bytes even if the client scrubs the image payload).
+	OutputFormatBoth = "both"
+)
+
+// defaultOutputFormat is what we use when the caller omits outputFormat.
+// Keeping the default at OutputFormatImage preserves the existing wire format
+// for clients that have not been updated.
+const defaultOutputFormat = OutputFormatImage
+
 // StringOrSlice is a type that can be unmarshaled from either a JSON string
 // or an array of strings. This allows dashboard variables to support both
 // single-value (e.g., "prometheus") and multi-value (e.g., ["server1", "server2"])
@@ -74,6 +98,7 @@ type GetPanelImageParams struct {
 	Theme        *string                  `json:"theme,omitempty" jsonschema:"description=Theme for the rendered image: light or dark. Defaults to dark"`
 	Scale        *int                     `json:"scale,omitempty" jsonschema:"description=Scale factor for the image (1-3). Defaults to 1"`
 	Timeout      *int                     `json:"timeout,omitempty" jsonschema:"description=Rendering timeout in seconds. Defaults to 60"`
+	OutputFormat *string                  `json:"outputFormat,omitempty" jsonschema:"enum=image,enum=resource,enum=both,description=How to package the rendered bytes. 'image' (default) returns a single MCP ImageContent block for backward compatibility. 'resource' returns an EmbeddedResource with a BlobResourceContents blob – useful for clients that strip ImageContent payloads out of PostToolUse hook pipelines. 'both' returns both so the model can display the image inline and downstream scripts can still recover the raw bytes."`
 }
 
 type RenderTimeRange struct {
@@ -87,6 +112,13 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 
 	if baseURL == "" {
 		return nil, fmt.Errorf("grafana URL not configured. Please set GRAFANA_URL environment variable or X-Grafana-URL header")
+	}
+
+	// Validate outputFormat up front so we fail fast on typos rather than
+	// silently returning the wrong content shape.
+	outputFormat, err := resolveOutputFormat(args.OutputFormat)
+	if err != nil {
+		return nil, err
 	}
 
 	// Build the render URL
@@ -156,18 +188,76 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 		return nil, fmt.Errorf("failed to read image data: %w", err)
 	}
 
-	// Return the image as base64 encoded data using MCP's image content type
+	// Derive the MIME type from the Accept negotiation result rather than
+	// hard-coding image/png, so the client sees the true format if Grafana
+	// ever serves back something else (JPEG/WebP via a proxy).
+	mimeType := resp.Header.Get("Content-Type")
+	if mimeType == "" || !strings.HasPrefix(mimeType, "image/") {
+		mimeType = "image/png"
+	}
+
+	return buildPanelImageResult(args, outputFormat, mimeType, imageData), nil
+}
+
+// resolveOutputFormat normalizes and validates the caller-supplied outputFormat.
+// nil / empty → default; unknown values → explicit error so callers see the
+// typo instead of getting a silently wrong content shape.
+func resolveOutputFormat(raw *string) (string, error) {
+	if raw == nil {
+		return defaultOutputFormat, nil
+	}
+	v := strings.ToLower(strings.TrimSpace(*raw))
+	if v == "" {
+		return defaultOutputFormat, nil
+	}
+	switch v {
+	case OutputFormatImage, OutputFormatResource, OutputFormatBoth:
+		return v, nil
+	default:
+		return "", fmt.Errorf(
+			"invalid outputFormat %q: expected one of %q, %q, %q",
+			*raw, OutputFormatImage, OutputFormatResource, OutputFormatBoth,
+		)
+	}
+}
+
+// buildPanelImageResult packages raw image bytes into the requested MCP
+// content shape. Split out so the HTTP plumbing above stays readable and so
+// tests can cover the packaging logic without a live Grafana.
+func buildPanelImageResult(args GetPanelImageParams, outputFormat, mimeType string, imageData []byte) *mcp.CallToolResult {
 	base64Data := base64.StdEncoding.EncodeToString(imageData)
 
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{
-			mcp.ImageContent{
-				Type:     "image",
-				Data:     base64Data,
-				MIMEType: "image/png",
+	contents := make([]mcp.Content, 0, 2)
+	if outputFormat == OutputFormatImage || outputFormat == OutputFormatBoth {
+		contents = append(contents, mcp.ImageContent{
+			Type:     "image",
+			Data:     base64Data,
+			MIMEType: mimeType,
+		})
+	}
+	if outputFormat == OutputFormatResource || outputFormat == OutputFormatBoth {
+		contents = append(contents, mcp.EmbeddedResource{
+			Type: "resource",
+			Resource: mcp.BlobResourceContents{
+				URI:      buildRenderResourceURI(args),
+				MIMEType: mimeType,
+				Blob:     base64Data,
 			},
-		},
-	}, nil
+		})
+	}
+
+	return &mcp.CallToolResult{Content: contents}
+}
+
+// buildRenderResourceURI produces a stable, human-readable URI for the
+// EmbeddedResource. It encodes just enough to tell two renders of the same
+// dashboard apart when they show up side by side in a log.
+func buildRenderResourceURI(args GetPanelImageParams) string {
+	uid := url.PathEscape(args.DashboardUID)
+	if args.PanelID != nil {
+		return fmt.Sprintf("grafana://render/dashboard/%s/panel/%d", uid, *args.PanelID)
+	}
+	return fmt.Sprintf("grafana://render/dashboard/%s", uid)
 }
 
 func buildRenderURL(baseURL string, args GetPanelImageParams) (string, error) {
