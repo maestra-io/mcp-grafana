@@ -171,11 +171,19 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 
 	// Check response status. The error body is bounded by the same limit
 	// as the success path so a hostile upstream can't OOM us by streaming
-	// a huge 5xx response.
+	// a huge 5xx response. If the body overflowed even that cap we skip
+	// embedding it in the error message (it would just balloon logs/tool
+	// response without adding any useful diagnostic).
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, renderResponseLimitBytes+1))
 		if resp.StatusCode == http.StatusNotFound {
 			return nil, fmt.Errorf("image renderer not available. Ensure the Grafana Image Renderer service is installed and configured. See https://grafana.com/docs/grafana/latest/setup-grafana/image-rendering/")
+		}
+		if int64(len(body)) > renderResponseLimitBytes {
+			return nil, fmt.Errorf(
+				"failed to render image: HTTP %d - response body exceeded %d-byte limit",
+				resp.StatusCode, renderResponseLimitBytes,
+			)
 		}
 		return nil, fmt.Errorf("failed to render image: HTTP %d - %s", resp.StatusCode, string(body))
 	}

@@ -880,9 +880,12 @@ func TestGetPanelImage_ErrorBodyBounded(t *testing.T) {
 
 	_, err := getPanelImage(ctx, GetPanelImageParams{DashboardUID: "test-dash"})
 	require.Error(t, err)
-	// The error still includes the HTTP code; it just can't carry the
-	// entire 25MB+ body in the message.
+	// The error must carry the HTTP code but NOT the raw (potentially
+	// multi-megabyte) body — instead, surface the overflow explicitly.
 	assert.Contains(t, err.Error(), "HTTP 500")
+	assert.Contains(t, err.Error(), "exceeded")
+	assert.NotContains(t, err.Error(), strings.Repeat("x", 1024),
+		"oversize error bodies must not leak into the error message")
 }
 
 // TestGetPanelImage_EmptyBody covers the 200-OK-with-zero-bytes case. A
