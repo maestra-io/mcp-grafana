@@ -840,12 +840,31 @@ func TestGetPanelImage_MIMETypeFromResponse(t *testing.T) {
 // TestGetPanelImage_ResponseTooLarge covers the OOM guard. Without it, a
 // misbehaving upstream that streams multi-GB data would crash the server;
 // with it, we refuse to buffer beyond renderResponseLimitBytes and return
-// a structured error instead.
+// a structured error instead. The handler streams the oversize body in
+// small chunks rather than allocating a 25MiB buffer in the test process —
+// the client-side LimitReader stops consuming well before the handler
+// finishes writing, so only a small prefix is actually transferred.
 func TestGetPanelImage_ResponseTooLarge(t *testing.T) {
-	// One byte over the limit is enough to trigger the guard; we don't
-	// need to actually allocate 25MiB of ones in the test server.
-	overLimit := bytes.Repeat([]byte{0x89}, renderResponseLimitBytes+1)
-	server := newImageServer(t, overLimit, "image/png")
+	const chunkSize = 64 * 1024
+	chunk := bytes.Repeat([]byte{0x89}, chunkSize)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.WriteHeader(http.StatusOK)
+		remaining := renderResponseLimitBytes + 1
+		for remaining > 0 {
+			n := chunkSize
+			if remaining < n {
+				n = remaining
+			}
+			if _, err := w.Write(chunk[:n]); err != nil {
+				// Client closed the connection — that's the
+				// expected path once LimitReader has its bytes.
+				return
+			}
+			remaining -= n
+		}
+	}))
 	defer server.Close()
 
 	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
@@ -861,15 +880,24 @@ func TestGetPanelImage_ResponseTooLarge(t *testing.T) {
 // TestGetPanelImage_ErrorBodyBounded verifies the non-200 error path also
 // respects renderResponseLimitBytes. A hostile upstream could otherwise
 // stream a huge 5xx body to OOM us while we try to include it in the
-// error message.
+// error message. Body is streamed in chunks to keep test memory low.
 func TestGetPanelImage_ErrorBodyBounded(t *testing.T) {
-	// Serve an oversized body with a 500 status. The handler must stop
-	// reading at the limit rather than buffering the whole response.
+	const chunkSize = 64 * 1024
+	chunk := bytes.Repeat([]byte{'x'}, chunkSize)
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		// Write a chunk slightly over the limit; net/http will happily
-		// stream it if we don't cap the read side.
-		_, _ = w.Write(bytes.Repeat([]byte{'x'}, renderResponseLimitBytes+1024))
+		remaining := renderResponseLimitBytes + 1024
+		for remaining > 0 {
+			n := chunkSize
+			if remaining < n {
+				n = remaining
+			}
+			if _, err := w.Write(chunk[:n]); err != nil {
+				return
+			}
+			remaining -= n
+		}
 	}))
 	defer server.Close()
 

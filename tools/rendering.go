@@ -33,11 +33,13 @@ const (
 )
 
 // renderResponseLimitBytes caps how much we'll read from the Grafana
-// /render endpoint before giving up. Matches the 10MB convention used by
-// other HTTP tools in this package (sift, elasticsearch, loki, clickhouse);
-// single panels average ~100KB PNG and full dashboards rarely exceed ~2MB
-// even at scale=3.
-const renderResponseLimitBytes = 25 * 1024 * 1024
+// /render endpoint before giving up. Follows the same bounded-read
+// pattern as the other HTTP tools in this package (sift, elasticsearch,
+// loki, clickhouse — all in the ~10MiB range) but with a higher cap to
+// accommodate PNG renders: single panels average ~100KiB and full
+// dashboards rarely exceed ~2MiB even at scale=3, so 25MiB leaves
+// plenty of headroom while still bounding blast radius.
+const renderResponseLimitBytes = 25 * 1024 * 1024 // 25 MiB
 
 // StringOrSlice is a type that can be unmarshaled from either a JSON string
 // or an array of strings. This allows dashboard variables to support both
