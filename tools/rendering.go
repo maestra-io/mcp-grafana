@@ -30,13 +30,23 @@ const (
 	outputFormatResource = "resource" // single EmbeddedResource with a BlobResourceContents
 	outputFormatBoth     = "both"     // both blocks (image for inline display, resource for out-of-band bytes)
 	// outputFormatTextBase64 returns a single TextContent block with just
-	// the base64-encoded PNG bytes and nothing else. Unlike ImageContent
-	// or EmbeddedResource (both of which common MCP clients render as
-	// images and hide from the LLM's text context), TextContent is passed
-	// through verbatim — so the LLM can see the base64, write it into a
-	// short script, and decode it to disk via Bash. The tradeoff is that
-	// the base64 occupies real output tokens, so this mode is only
-	// appropriate for smallish renders (≲100KiB PNG / ≲30K output tokens).
+	// the base64-encoded PNG bytes and nothing else. Motivation: Claude
+	// Code surfaces ImageContent (and image/* EmbeddedResource blobs) as
+	// images to the user and as vision input to the model, but hides the
+	// base64 string from the model's text context — so a skill that
+	// wants the model to decode the bytes to disk via Bash/Write has no
+	// way to see them. TextContent is passed through as text, which
+	// closes that gap. Behavior on non-Claude-Code clients is
+	// client-specific: some (Cursor, Zed, Claude Desktop) will render the
+	// raw base64 verbatim in the transcript, which is hostile to humans —
+	// callers on those clients should stick to 'image'/'resource'/'both'.
+	//
+	// Cost: the base64 rides back through the model's output window,
+	// which means the model must re-emit it (Write tool content or Bash
+	// heredoc) to land bytes on disk. Enforced upper bound is
+	// textBase64MaxImageBytes; practical limit is lower on models with
+	// smaller max_output_tokens. Use only for single-panel screenshots,
+	// not full-dashboard captures.
 	outputFormatTextBase64 = "text_base64"
 	outputFormatDefault    = outputFormatImage
 )
@@ -49,6 +59,14 @@ const (
 // dashboards rarely exceed ~2MiB even at scale=3, so 25MiB leaves
 // plenty of headroom while still bounding blast radius.
 const renderResponseLimitBytes = 25 * 1024 * 1024 // 25 MiB
+
+// textBase64MaxImageBytes caps the raw-image size accepted by the
+// text_base64 output path. The mode requires the model to emit the full
+// base64 string in a single output turn (→ Write/Bash), so a too-large
+// payload gets silently truncated by the model's output cap and a
+// corrupted file lands on disk. Prefer a hard server-side error with a
+// clear remediation hint over that silent failure mode.
+const textBase64MaxImageBytes = 512 * 1024 // 512 KiB (~683 KiB base64)
 
 // StringOrSlice is a type that can be unmarshaled from either a JSON string
 // or an array of strings. This allows dashboard variables to support both
@@ -217,6 +235,29 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 	}
 
 	mimeType := parseImageMIME(resp.Header.Get("Content-Type"))
+
+	// text_base64 is explicitly advertised as "base64 PNG bytes" in the
+	// tool description; the model will name the output file .png. Reject
+	// non-PNG upstream responses rather than silently emitting bytes a
+	// caller will misidentify. Grafana's image renderer always produces
+	// PNG today — this guard is just defensive against future proxies.
+	if outputFormat == outputFormatTextBase64 && mimeType != "image/png" {
+		return nil, fmt.Errorf(
+			"outputFormat=text_base64 requires Grafana to return image/png; got %q", mimeType,
+		)
+	}
+	// Keep the text_base64 payload small enough that a reasonable Claude
+	// output window can actually emit it back to a Write/Bash step. 512KiB
+	// of raw PNG → ~683KiB of base64 → ~170K tokens at ~4 chars/token on a
+	// base64 alphabet, which is already above a typical 64K output cap
+	// but lets the guard catch obvious misuse (full-dashboard renders)
+	// without false-positive-ing single-panel screenshots.
+	if outputFormat == outputFormatTextBase64 && len(imageData) > textBase64MaxImageBytes {
+		return nil, fmt.Errorf(
+			"outputFormat=text_base64 payload exceeds %d-byte limit (got %d); reduce width/height/scale or switch to outputFormat=image/resource",
+			textBase64MaxImageBytes, len(imageData),
+		)
+	}
 
 	return buildPanelImageResult(args, outputFormat, mimeType, imageData), nil
 }
