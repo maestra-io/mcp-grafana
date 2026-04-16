@@ -29,7 +29,16 @@ const (
 	outputFormatImage    = "image"    // single ImageContent; legacy/default shape
 	outputFormatResource = "resource" // single EmbeddedResource with a BlobResourceContents
 	outputFormatBoth     = "both"     // both blocks (image for inline display, resource for out-of-band bytes)
-	outputFormatDefault  = outputFormatImage
+	// outputFormatTextBase64 returns a single TextContent block with just
+	// the base64-encoded PNG bytes and nothing else. Unlike ImageContent
+	// or EmbeddedResource (both of which common MCP clients render as
+	// images and hide from the LLM's text context), TextContent is passed
+	// through verbatim — so the LLM can see the base64, write it into a
+	// short script, and decode it to disk via Bash. The tradeoff is that
+	// the base64 occupies real output tokens, so this mode is only
+	// appropriate for smallish renders (≲100KiB PNG / ≲30K output tokens).
+	outputFormatTextBase64 = "text_base64"
+	outputFormatDefault    = outputFormatImage
 )
 
 // renderResponseLimitBytes caps how much we'll read from the Grafana
@@ -96,7 +105,7 @@ type GetPanelImageParams struct {
 	Theme        *string                  `json:"theme,omitempty" jsonschema:"description=Theme for the rendered image: light or dark. Defaults to dark"`
 	Scale        *int                     `json:"scale,omitempty" jsonschema:"description=Scale factor for the image (1-3). Defaults to 1"`
 	Timeout      *int                     `json:"timeout,omitempty" jsonschema:"description=Rendering timeout in seconds. Defaults to 60"`
-	OutputFormat *string                  `json:"outputFormat,omitempty" jsonschema:"enum=image,enum=resource,enum=both,default=image,description=How to package the rendered bytes. 'image' (default) returns a single MCP ImageContent block for backward compatibility. 'resource' returns an EmbeddedResource with a BlobResourceContents blob - useful for clients or tooling that cannot decode inline ImageContent payloads. 'both' returns both content blocks so the model can display the image inline while out-of-band scripts recover the raw bytes from the resource. Note that 'both' roughly doubles response size."`
+	OutputFormat *string                  `json:"outputFormat,omitempty" jsonschema:"enum=image,enum=resource,enum=both,enum=text_base64,default=image,description=How to package the rendered bytes. 'image' (default) returns a single MCP ImageContent block for backward compatibility. 'resource' returns an EmbeddedResource with a BlobResourceContents blob - useful for clients or tooling that cannot decode inline ImageContent payloads. 'both' returns both content blocks so the model can display the image inline while out-of-band scripts recover the raw bytes from the resource. 'text_base64' returns a single TextContent block with only the base64 bytes as plain text - use this when the caller needs to pipe the image through a Bash/Write step to land on disk (ImageContent/EmbeddedResource blobs are rendered as images by most MCP clients and are not accessible to the model as text). Note that 'both' roughly doubles response size and 'text_base64' consumes real output tokens."`
 }
 
 type RenderTimeRange struct {
@@ -243,12 +252,12 @@ func resolveOutputFormat(raw *string) (string, error) {
 		return outputFormatDefault, nil
 	}
 	switch *raw {
-	case outputFormatImage, outputFormatResource, outputFormatBoth:
+	case outputFormatImage, outputFormatResource, outputFormatBoth, outputFormatTextBase64:
 		return *raw, nil
 	default:
 		return "", fmt.Errorf(
-			"invalid outputFormat %q: expected one of %q, %q, %q",
-			*raw, outputFormatImage, outputFormatResource, outputFormatBoth,
+			"invalid outputFormat %q: expected one of %q, %q, %q, %q",
+			*raw, outputFormatImage, outputFormatResource, outputFormatBoth, outputFormatTextBase64,
 		)
 	}
 }
@@ -298,6 +307,16 @@ func buildPanelImageResult(args GetPanelImageParams, outputFormat, mimeType stri
 				MIMEType: mimeType,
 				Blob:     base64Data,
 			},
+		})
+	}
+	if outputFormat == outputFormatTextBase64 {
+		// Emit ONLY the base64 string, with no surrounding wrapper or
+		// prose. The caller is expected to read this verbatim into a
+		// Bash/script step (e.g. `base64 -d > file.png`), so any extra
+		// characters would corrupt the decoded output.
+		contents = append(contents, mcp.TextContent{
+			Type: "text",
+			Text: base64Data,
 		})
 	}
 

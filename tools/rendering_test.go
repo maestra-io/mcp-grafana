@@ -569,6 +569,7 @@ func TestResolveOutputFormat(t *testing.T) {
 		{name: "image literal", input: stringPtr("image"), want: outputFormatImage},
 		{name: "resource literal", input: stringPtr("resource"), want: outputFormatResource},
 		{name: "both literal", input: stringPtr("both"), want: outputFormatBoth},
+		{name: "text_base64 literal", input: stringPtr("text_base64"), want: outputFormatTextBase64},
 		// Schema advertises lowercase only; we reject deviations so a
 		// client that validates against the enum sees the same behavior
 		// as the server. Explicit "" is a caller bug, not a "don't care"
@@ -708,6 +709,17 @@ func TestGetPanelImage_OutputFormats(t *testing.T) {
 		assert.Equal(t, wantB64, blob.Blob)
 	}
 
+	assertTextBase64 := func(t *testing.T, result *mcp.CallToolResult) {
+		t.Helper()
+		require.Len(t, result.Content, 1, "text_base64 must emit exactly one TextContent block")
+		txt, ok := result.Content[0].(mcp.TextContent)
+		require.True(t, ok, "content must be TextContent, got %T", result.Content[0])
+		assert.Equal(t, "text", txt.Type)
+		// Must be ONLY the base64 — no prefix, suffix, or wrapper. Any
+		// stray characters would corrupt a downstream `base64 -d` pipe.
+		assert.Equal(t, wantB64, txt.Text)
+	}
+
 	cases := []struct {
 		name   string
 		format *string
@@ -717,6 +729,7 @@ func TestGetPanelImage_OutputFormats(t *testing.T) {
 		{name: "explicit image", format: stringPtr("image"), check: assertImageOnly},
 		{name: "resource only", format: stringPtr("resource"), check: assertResourceOnly},
 		{name: "both", format: stringPtr("both"), check: assertBoth},
+		{name: "text_base64", format: stringPtr("text_base64"), check: assertTextBase64},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -760,6 +773,35 @@ func TestGetPanelImage_InvalidOutputFormat(t *testing.T) {
 	assert.Contains(t, err.Error(), "image")
 	assert.Contains(t, err.Error(), "resource")
 	assert.Contains(t, err.Error(), "both")
+	assert.Contains(t, err.Error(), "text_base64")
+}
+
+// TestGetPanelImage_TextBase64_DecodesToOriginalBytes locks in the contract
+// that callers rely on when they pipe the returned text through `base64 -d`:
+// the TextContent.Text field must be exactly the base64 encoding of the
+// image bytes, with no prose, prefix, or trailing whitespace that would
+// make the decoded output garbage.
+func TestGetPanelImage_TextBase64_DecodesToOriginalBytes(t *testing.T) {
+	testPNGData := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xde, 0xad, 0xbe, 0xef}
+	server := newImageServer(t, testPNGData, "image/png")
+	defer server.Close()
+
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL:    server.URL,
+		APIKey: "test-api-key",
+	})
+
+	result, err := getPanelImage(ctx, GetPanelImageParams{
+		DashboardUID: "test-dash",
+		OutputFormat: stringPtr("text_base64"),
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Content, 1)
+
+	txt := result.Content[0].(mcp.TextContent)
+	decoded, err := base64.StdEncoding.DecodeString(txt.Text)
+	require.NoError(t, err, "TextContent.Text must be plain base64 with no wrapper")
+	assert.Equal(t, testPNGData, decoded)
 }
 
 // TestGetPanelImage_PanelURIIncludesPanelID ensures EmbeddedResource URIs for
