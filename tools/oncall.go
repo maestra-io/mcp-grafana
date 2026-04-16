@@ -529,7 +529,8 @@ var GetAlertGroup = mcpgrafana.MustTool(
 // The amixr-api-go-client library doesn't expose these action methods, so we call the API directly.
 // OnCall returns 200 with an empty body for these action endpoints, so we fetch the updated
 // alert group separately with a GET request.
-func alertGroupAction(ctx context.Context, alertGroupID, action string) (*aapi.AlertGroup, error) {
+// body, if non-nil, is sent as a URL-encoded form payload (required by some endpoints like silence).
+func alertGroupAction(ctx context.Context, alertGroupID, action string, body interface{}) (*aapi.AlertGroup, error) {
 	alertGroupID = strings.TrimSpace(alertGroupID)
 	if alertGroupID == "" {
 		return nil, fmt.Errorf("alertGroupId is required")
@@ -542,7 +543,7 @@ func alertGroupAction(ctx context.Context, alertGroupID, action string) (*aapi.A
 
 	escapedID := url.PathEscape(alertGroupID)
 	path := fmt.Sprintf("alert_groups/%s/%s/", escapedID, action)
-	req, err := client.NewRequest("POST", path, nil)
+	req, err := client.NewRequest("POST", path, body)
 	if err != nil {
 		return nil, fmt.Errorf("creating %s request: %w", action, err)
 	}
@@ -569,7 +570,7 @@ type AlertGroupActionParams struct {
 }
 
 func acknowledgeAlertGroup(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
-	return alertGroupAction(ctx, args.AlertGroupID, "acknowledge")
+	return alertGroupAction(ctx, args.AlertGroupID, "acknowledge", nil)
 }
 
 var AcknowledgeAlertGroup = mcpgrafana.MustTool(
@@ -580,7 +581,7 @@ var AcknowledgeAlertGroup = mcpgrafana.MustTool(
 )
 
 func unacknowledgeAlertGroup(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
-	return alertGroupAction(ctx, args.AlertGroupID, "unacknowledge")
+	return alertGroupAction(ctx, args.AlertGroupID, "unacknowledge", nil)
 }
 
 var UnacknowledgeAlertGroup = mcpgrafana.MustTool(
@@ -591,7 +592,7 @@ var UnacknowledgeAlertGroup = mcpgrafana.MustTool(
 )
 
 func resolveAlertGroup(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
-	return alertGroupAction(ctx, args.AlertGroupID, "resolve")
+	return alertGroupAction(ctx, args.AlertGroupID, "resolve", nil)
 }
 
 var ResolveAlertGroup = mcpgrafana.MustTool(
@@ -601,19 +602,25 @@ var ResolveAlertGroup = mcpgrafana.MustTool(
 	mcp.WithTitleAnnotation("Resolve alert group"),
 )
 
-func silenceAlertGroup(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
-	return alertGroupAction(ctx, args.AlertGroupID, "silence")
+type SilenceAlertGroupParams struct {
+	AlertGroupID string `json:"alertGroupId" jsonschema:"required,description=The ID of the alert group to silence"`
+	Delay        int    `json:"delay" jsonschema:"required,description=Silence duration in seconds. Use -1 to silence forever. Common values: 1800 (30m)\\, 3600 (1h)\\, 14400 (4h)\\, 43200 (12h)\\, 86400 (24h)\\, -1 (forever)"`
+}
+
+func silenceAlertGroup(ctx context.Context, args SilenceAlertGroupParams) (*aapi.AlertGroup, error) {
+	body := map[string]int{"delay": args.Delay}
+	return alertGroupAction(ctx, args.AlertGroupID, "silence", body)
 }
 
 var SilenceAlertGroup = mcpgrafana.MustTool(
 	"silence_alert_group",
-	"Silence a specific Grafana OnCall alert group by its ID. Changes the alert group state to 'silenced'. Returns the updated alert group.",
+	"Silence a specific Grafana OnCall alert group by its ID for a given duration. Changes the alert group state to 'silenced'. The 'delay' parameter is required — use -1 to silence forever, or a positive number of seconds (e.g., 3600 for one hour). Returns the updated alert group.",
 	silenceAlertGroup,
 	mcp.WithTitleAnnotation("Silence alert group"),
 )
 
 func unsilenceAlertGroup(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
-	return alertGroupAction(ctx, args.AlertGroupID, "unsilence")
+	return alertGroupAction(ctx, args.AlertGroupID, "unsilence", nil)
 }
 
 var UnsilenceAlertGroup = mcpgrafana.MustTool(
