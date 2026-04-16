@@ -169,9 +169,11 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Check response status
+	// Check response status. The error body is bounded by the same limit
+	// as the success path so a hostile upstream can't OOM us by streaming
+	// a huge 5xx response.
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, renderResponseLimitBytes+1))
 		if resp.StatusCode == http.StatusNotFound {
 			return nil, fmt.Errorf("image renderer not available. Ensure the Grafana Image Renderer service is installed and configured. See https://grafana.com/docs/grafana/latest/setup-grafana/image-rendering/")
 		}
@@ -219,18 +221,18 @@ func parseImageMIME(raw string) string {
 	return mt
 }
 
-// resolveOutputFormat validates the caller-supplied outputFormat. nil → default;
-// unknown values → explicit error so callers see the typo instead of getting a
-// silently wrong content shape. The accepted set is exactly what the JSON
-// schema advertises — no case or whitespace tolerance, so a client that
-// validates against the advertised enum sees the same behavior as the server.
+// resolveOutputFormat validates the caller-supplied outputFormat. A nil
+// pointer (field omitted) resolves to the default; every other value must
+// match the schema enum exactly. This includes the empty string — an
+// explicit "" is a caller bug, not "I don't care", and silently defaulting
+// it would hide that. The accepted set is exactly what the JSON schema
+// advertises, so a client that validates locally sees the same behavior
+// as the server.
 func resolveOutputFormat(raw *string) (string, error) {
 	if raw == nil {
 		return outputFormatDefault, nil
 	}
 	switch *raw {
-	case "":
-		return outputFormatDefault, nil
 	case outputFormatImage, outputFormatResource, outputFormatBoth:
 		return *raw, nil
 	default:
@@ -306,7 +308,11 @@ func buildPanelImageResult(args GetPanelImageParams, outputFormat, mimeType stri
 func buildRenderResourceURI(args GetPanelImageParams, imageData []byte) string {
 	uid := url.PathEscape(args.DashboardUID)
 	sum := sha256.Sum256(imageData)
-	hash := hex.EncodeToString(sum[:4]) // 8 hex chars — enough to disambiguate
+	// 128 bits (32 hex chars) keeps the collision probability negligible
+	// even across millions of distinct renders — a shorter prefix would
+	// start aliasing surprisingly quickly (birthday bound on 32 bits is
+	// ~65k renders).
+	hash := hex.EncodeToString(sum[:16])
 	if args.PanelID != nil {
 		return fmt.Sprintf("grafana://render/dashboard/%s/panel/%d?h=%s", uid, *args.PanelID, hash)
 	}

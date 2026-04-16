@@ -3,6 +3,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -565,13 +566,14 @@ func TestResolveOutputFormat(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "nil -> default", input: nil, want: outputFormatImage},
-		{name: "empty -> default", input: stringPtr(""), want: outputFormatImage},
 		{name: "image literal", input: stringPtr("image"), want: outputFormatImage},
 		{name: "resource literal", input: stringPtr("resource"), want: outputFormatResource},
 		{name: "both literal", input: stringPtr("both"), want: outputFormatBoth},
-		// The schema advertises lowercase only; we reject deviations so a
+		// Schema advertises lowercase only; we reject deviations so a
 		// client that validates against the enum sees the same behavior
-		// as the server.
+		// as the server. Explicit "" is a caller bug, not a "don't care"
+		// signal — the pointer being nil is the only valid "don't care".
+		{name: "empty string rejected", input: stringPtr(""), wantErr: true},
 		{name: "uppercase rejected", input: stringPtr("BOTH"), wantErr: true},
 		{name: "whitespace rejected", input: stringPtr(" both "), wantErr: true},
 		{name: "unknown value errors", input: stringPtr("binary"), wantErr: true},
@@ -592,9 +594,9 @@ func TestResolveOutputFormat(t *testing.T) {
 
 func TestBuildRenderResourceURI(t *testing.T) {
 	// Pinned so the test fails loudly if the hashing scheme ever changes
-	// accidentally. Computed as hex.EncodeToString(sha256("payload")[:4]).
+	// accidentally. Computed as hex.EncodeToString(sha256("payload")[:16]).
 	const payload = "payload"
-	const wantHash = "239f59ed"
+	const wantHash = "239f59ed55e737c77147cf55ad0c1b03"
 
 	tests := []struct {
 		name string
@@ -833,6 +835,54 @@ func TestGetPanelImage_MIMETypeFromResponse(t *testing.T) {
 			assert.Equal(t, tt.wantMIME, blob.MIMEType)
 		})
 	}
+}
+
+// TestGetPanelImage_ResponseTooLarge covers the OOM guard. Without it, a
+// misbehaving upstream that streams multi-GB data would crash the server;
+// with it, we refuse to buffer beyond renderResponseLimitBytes and return
+// a structured error instead.
+func TestGetPanelImage_ResponseTooLarge(t *testing.T) {
+	// One byte over the limit is enough to trigger the guard; we don't
+	// need to actually allocate 25MiB of ones in the test server.
+	overLimit := bytes.Repeat([]byte{0x89}, renderResponseLimitBytes+1)
+	server := newImageServer(t, overLimit, "image/png")
+	defer server.Close()
+
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL:    server.URL,
+		APIKey: "test-api-key",
+	})
+
+	_, err := getPanelImage(ctx, GetPanelImageParams{DashboardUID: "test-dash"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeded")
+}
+
+// TestGetPanelImage_ErrorBodyBounded verifies the non-200 error path also
+// respects renderResponseLimitBytes. A hostile upstream could otherwise
+// stream a huge 5xx body to OOM us while we try to include it in the
+// error message.
+func TestGetPanelImage_ErrorBodyBounded(t *testing.T) {
+	// Serve an oversized body with a 500 status. The handler must stop
+	// reading at the limit rather than buffering the whole response.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		// Write a chunk slightly over the limit; net/http will happily
+		// stream it if we don't cap the read side.
+		_, _ = w.Write(bytes.Repeat([]byte{'x'}, renderResponseLimitBytes+1024))
+	}))
+	defer server.Close()
+
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL:    server.URL,
+		APIKey: "test-api-key",
+	})
+
+	_, err := getPanelImage(ctx, GetPanelImageParams{DashboardUID: "test-dash"})
+	require.Error(t, err)
+	// The error still includes the HTTP code; it just can't carry the
+	// entire 25MB+ body in the message.
+	assert.Contains(t, err.Error(), "HTTP 500")
 }
 
 // TestGetPanelImage_EmptyBody covers the 200-OK-with-zero-bytes case. A
