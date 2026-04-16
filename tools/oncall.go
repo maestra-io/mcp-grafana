@@ -527,6 +527,8 @@ var GetAlertGroup = mcpgrafana.MustTool(
 
 // alertGroupAction performs a POST action on an alert group (resolve, acknowledge, etc.).
 // The amixr-api-go-client library doesn't expose these action methods, so we call the API directly.
+// OnCall returns 200 with an empty body for these action endpoints, so we fetch the updated
+// alert group separately with a GET request.
 func alertGroupAction(ctx context.Context, alertGroupID, action string) (*aapi.AlertGroup, error) {
 	alertGroupID = strings.TrimSpace(alertGroupID)
 	if alertGroupID == "" {
@@ -545,13 +547,18 @@ func alertGroupAction(ctx context.Context, alertGroupID, action string) (*aapi.A
 		return nil, fmt.Errorf("creating %s request: %w", action, err)
 	}
 
-	var alertGroup *aapi.AlertGroup
-	_, err = client.Do(req, &alertGroup)
-	if err != nil {
+	// Pass nil so the client doesn't try to JSON-decode the empty response body.
+	if _, err = client.Do(req, nil); err != nil {
 		return nil, fmt.Errorf("%s alert group %s: %w", action, alertGroupID, err)
 	}
+
+	// Fetch the updated alert group to return the new state.
+	alertGroup, _, err := aapi.NewAlertGroupService(client).GetAlertGroup(alertGroupID)
+	if err != nil {
+		return nil, fmt.Errorf("fetching alert group %s after %s: %w", alertGroupID, action, err)
+	}
 	if alertGroup == nil {
-		return nil, fmt.Errorf("%s alert group %s: empty response body", action, alertGroupID)
+		return nil, fmt.Errorf("fetching alert group %s after %s: empty response", alertGroupID, action)
 	}
 
 	return alertGroup, nil
