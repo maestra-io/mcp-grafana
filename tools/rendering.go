@@ -2,10 +2,13 @@ package tools
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -18,6 +21,25 @@ import (
 
 	mcpgrafana "github.com/grafana/mcp-grafana"
 )
+
+// outputFormat* are the wire values accepted on GetPanelImageParams.OutputFormat.
+// Kept unexported because they are a JSON wire contract, not a Go API —
+// callers pass strings over MCP, not the Go constants.
+const (
+	outputFormatImage    = "image"    // single ImageContent; legacy/default shape
+	outputFormatResource = "resource" // single EmbeddedResource with a BlobResourceContents
+	outputFormatBoth     = "both"     // both blocks (image for inline display, resource for out-of-band bytes)
+	outputFormatDefault  = outputFormatImage
+)
+
+// renderResponseLimitBytes caps how much we'll read from the Grafana
+// /render endpoint before giving up. Follows the same bounded-read
+// pattern as the other HTTP tools in this package (sift, elasticsearch,
+// loki, clickhouse — all in the ~10MiB range) but with a higher cap to
+// accommodate PNG renders: single panels average ~100KiB and full
+// dashboards rarely exceed ~2MiB even at scale=3, so 25MiB leaves
+// plenty of headroom while still bounding blast radius.
+const renderResponseLimitBytes = 25 * 1024 * 1024 // 25 MiB
 
 // StringOrSlice is a type that can be unmarshaled from either a JSON string
 // or an array of strings. This allows dashboard variables to support both
@@ -74,6 +96,7 @@ type GetPanelImageParams struct {
 	Theme        *string                  `json:"theme,omitempty" jsonschema:"description=Theme for the rendered image: light or dark. Defaults to dark"`
 	Scale        *int                     `json:"scale,omitempty" jsonschema:"description=Scale factor for the image (1-3). Defaults to 1"`
 	Timeout      *int                     `json:"timeout,omitempty" jsonschema:"description=Rendering timeout in seconds. Defaults to 60"`
+	OutputFormat *string                  `json:"outputFormat,omitempty" jsonschema:"enum=image,enum=resource,enum=both,default=image,description=How to package the rendered bytes. 'image' (default) returns a single MCP ImageContent block for backward compatibility. 'resource' returns an EmbeddedResource with a BlobResourceContents blob - useful for clients or tooling that cannot decode inline ImageContent payloads. 'both' returns both content blocks so the model can display the image inline while out-of-band scripts recover the raw bytes from the resource. Note that 'both' roughly doubles response size."`
 }
 
 type RenderTimeRange struct {
@@ -87,6 +110,13 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 
 	if baseURL == "" {
 		return nil, fmt.Errorf("grafana URL not configured. Please set GRAFANA_URL environment variable or X-Grafana-URL header")
+	}
+
+	// Validate outputFormat up front so we fail fast on typos rather than
+	// silently returning the wrong content shape.
+	outputFormat, err := resolveOutputFormat(args.OutputFormat)
+	if err != nil {
+		return nil, err
 	}
 
 	// Build the render URL
@@ -141,33 +171,162 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Check response status
+	// Check response status. The error body is bounded by the same limit
+	// as the success path so a hostile upstream can't OOM us by streaming
+	// a huge 5xx response. If the body overflowed even that cap we skip
+	// embedding it in the error message (it would just balloon logs/tool
+	// response without adding any useful diagnostic).
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, renderResponseLimitBytes+1))
 		if resp.StatusCode == http.StatusNotFound {
 			return nil, fmt.Errorf("image renderer not available. Ensure the Grafana Image Renderer service is installed and configured. See https://grafana.com/docs/grafana/latest/setup-grafana/image-rendering/")
+		}
+		if int64(len(body)) > renderResponseLimitBytes {
+			return nil, fmt.Errorf(
+				"failed to render image: HTTP %d - response body exceeded %d-byte limit",
+				resp.StatusCode, renderResponseLimitBytes,
+			)
 		}
 		return nil, fmt.Errorf("failed to render image: HTTP %d - %s", resp.StatusCode, string(body))
 	}
 
-	// Read the image data
-	imageData, err := io.ReadAll(resp.Body)
+	// Read the image data. Bounded by renderResponseLimitBytes so a
+	// misbehaving upstream can't OOM the server.
+	imageData, err := io.ReadAll(io.LimitReader(resp.Body, renderResponseLimitBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read image data: %w", err)
 	}
+	if int64(len(imageData)) > renderResponseLimitBytes {
+		return nil, fmt.Errorf("render response exceeded %d-byte limit", renderResponseLimitBytes)
+	}
+	if len(imageData) == 0 {
+		// A 200 OK with an empty body would otherwise produce an
+		// ImageContent whose Data is "" — downstream hooks then write a
+		// zero-byte file and it looks like a successful render. Fail
+		// loudly so the caller knows the render actually failed.
+		return nil, fmt.Errorf("grafana returned an empty image body (HTTP 200)")
+	}
 
-	// Return the image as base64 encoded data using MCP's image content type
+	mimeType := parseImageMIME(resp.Header.Get("Content-Type"))
+
+	return buildPanelImageResult(args, outputFormat, mimeType, imageData), nil
+}
+
+// parseImageMIME extracts the media type (no params) from a Content-Type
+// header, falling back to image/png. It exists because:
+//   - Some gateways (Kong/nginx) append parameters like "; charset=utf-8"
+//     which are nonsensical for images and confuse strict MCP clients that
+//     treat the MIME field as a bare media type.
+//   - Completely missing or non-image types (e.g. text/html from an auth
+//     wall served as 200 OK) should not be labeled as the real content type —
+//     PNG is the only thing the Grafana image renderer actually emits.
+func parseImageMIME(raw string) string {
+	if raw == "" {
+		return "image/png"
+	}
+	mt, _, err := mime.ParseMediaType(raw)
+	if err != nil || !strings.HasPrefix(mt, "image/") {
+		return "image/png"
+	}
+	return mt
+}
+
+// resolveOutputFormat validates the caller-supplied outputFormat. A nil
+// pointer (field omitted) resolves to the default; every other value must
+// match the schema enum exactly. This includes the empty string — an
+// explicit "" is a caller bug, not "I don't care", and silently defaulting
+// it would hide that. The accepted set is exactly what the JSON schema
+// advertises, so a client that validates locally sees the same behavior
+// as the server.
+func resolveOutputFormat(raw *string) (string, error) {
+	if raw == nil {
+		return outputFormatDefault, nil
+	}
+	switch *raw {
+	case outputFormatImage, outputFormatResource, outputFormatBoth:
+		return *raw, nil
+	default:
+		return "", fmt.Errorf(
+			"invalid outputFormat %q: expected one of %q, %q, %q",
+			*raw, outputFormatImage, outputFormatResource, outputFormatBoth,
+		)
+	}
+}
+
+// ptr is a tiny helper to produce pointer-typed values for MCP annotations,
+// which require *float64 to distinguish "not set" from zero.
+func ptr[T any](v T) *T { return &v }
+
+// buildPanelImageResult packages raw image bytes into the requested MCP
+// content shape. Split out so the HTTP plumbing above stays readable and so
+// tests can cover the packaging logic without a live Grafana.
+//
+// Annotations follow MCP conventions: the ImageContent is marked for both
+// the user and the model at high priority (it's the display surface). The
+// EmbeddedResource is marked for the user only at low priority so
+// context-pruning clients know they can drop it from the model's context
+// without losing the image — the out-of-band copy is for tooling, not for
+// the LLM.
+func buildPanelImageResult(args GetPanelImageParams, outputFormat, mimeType string, imageData []byte) *mcp.CallToolResult {
 	base64Data := base64.StdEncoding.EncodeToString(imageData)
 
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{
-			mcp.ImageContent{
-				Type:     "image",
-				Data:     base64Data,
-				MIMEType: "image/png",
+	contents := make([]mcp.Content, 0, 2)
+	if outputFormat == outputFormatImage || outputFormat == outputFormatBoth {
+		contents = append(contents, mcp.ImageContent{
+			Annotated: mcp.Annotated{
+				Annotations: &mcp.Annotations{
+					Audience: []mcp.Role{mcp.RoleUser, mcp.RoleAssistant},
+					Priority: ptr(0.9),
+				},
 			},
-		},
-	}, nil
+			Type:     "image",
+			Data:     base64Data,
+			MIMEType: mimeType,
+		})
+	}
+	if outputFormat == outputFormatResource || outputFormat == outputFormatBoth {
+		contents = append(contents, mcp.EmbeddedResource{
+			Annotated: mcp.Annotated{
+				Annotations: &mcp.Annotations{
+					Audience: []mcp.Role{mcp.RoleUser},
+					Priority: ptr(0.1),
+				},
+			},
+			Type: "resource",
+			Resource: mcp.BlobResourceContents{
+				URI:      buildRenderResourceURI(args, imageData),
+				MIMEType: mimeType,
+				Blob:     base64Data,
+			},
+		})
+	}
+
+	return &mcp.CallToolResult{Content: contents}
+}
+
+// buildRenderResourceURI produces an opaque identifier for the
+// EmbeddedResource. It is NOT resolvable via resources/read — this server
+// does not register a handler for the grafana:// scheme — the URI exists
+// purely to let clients/caches distinguish one render from another.
+//
+// A content-hash suffix is appended so that two renders of the same
+// dashboard with different time ranges, variables, or dimensions get
+// different URIs (otherwise clients that dedupe EmbeddedResource by URI
+// — which is spec-legal — would collapse them into one). Re-rendering
+// the exact same state produces the same URI by design, making it
+// usable as a weak cache key.
+func buildRenderResourceURI(args GetPanelImageParams, imageData []byte) string {
+	uid := url.PathEscape(args.DashboardUID)
+	sum := sha256.Sum256(imageData)
+	// 128 bits (32 hex chars) keeps the collision probability negligible
+	// even across millions of distinct renders — a shorter prefix would
+	// start aliasing surprisingly quickly (birthday bound on 32 bits is
+	// ~65k renders).
+	hash := hex.EncodeToString(sum[:16])
+	if args.PanelID != nil {
+		return fmt.Sprintf("grafana://render/dashboard/%s/panel/%d?h=%s", uid, *args.PanelID, hash)
+	}
+	return fmt.Sprintf("grafana://render/dashboard/%s?h=%s", uid, hash)
 }
 
 func buildRenderURL(baseURL string, args GetPanelImageParams) (string, error) {
