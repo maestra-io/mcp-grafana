@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -239,12 +240,27 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 	// text_base64 is explicitly advertised as "base64 PNG bytes" in the
 	// tool description; the model will name the output file .png. Reject
 	// non-PNG upstream responses rather than silently emitting bytes a
-	// caller will misidentify. Grafana's image renderer always produces
-	// PNG today — this guard is just defensive against future proxies.
-	if outputFormat == outputFormatTextBase64 && mimeType != "image/png" {
-		return nil, fmt.Errorf(
-			"outputFormat=text_base64 requires Grafana to return image/png; got %q", mimeType,
-		)
+	// caller will misidentify. We enforce this with two independent
+	// checks because neither alone is enough:
+	//
+	//   1. Content-Type header must be image/png. Catches proxies that
+	//      serve a different image format (image/jpeg, image/webp).
+	//   2. Magic-byte check on the body itself. Catches upstreams that
+	//      serve HTML/error pages with a missing or wrong Content-Type
+	//      (parseImageMIME falls back to "image/png" when the header is
+	//      absent or malformed, so the first check alone would pass).
+	if outputFormat == outputFormatTextBase64 {
+		if resp.Header.Get("Content-Type") != "" && mimeType != "image/png" {
+			return nil, fmt.Errorf(
+				"outputFormat=text_base64 requires Grafana to return image/png; got %q", mimeType,
+			)
+		}
+		if !hasPNGSignature(imageData) {
+			return nil, fmt.Errorf(
+				"outputFormat=text_base64 requires PNG bytes; response body is not a PNG (got Content-Type %q)",
+				resp.Header.Get("Content-Type"),
+			)
+		}
 	}
 	// Keep the text_base64 payload small enough that a reasonable Claude
 	// output window can actually emit it back to a Write/Bash step. 512KiB
@@ -260,6 +276,17 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 	}
 
 	return buildPanelImageResult(args, outputFormat, mimeType, imageData), nil
+}
+
+// pngSignature is the 8-byte ISO/IEC 15948 PNG magic header, as defined
+// in https://www.w3.org/TR/PNG/#5PNG-file-signature.
+var pngSignature = []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
+
+// hasPNGSignature reports whether data begins with the PNG magic bytes.
+// Used by the text_base64 output path to fail fast on responses that
+// pretend to be PNG (via Content-Type) but aren't.
+func hasPNGSignature(data []byte) bool {
+	return len(data) >= len(pngSignature) && bytes.Equal(data[:len(pngSignature)], pngSignature)
 }
 
 // parseImageMIME extracts the media type (no params) from a Content-Type

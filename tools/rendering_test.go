@@ -845,11 +845,13 @@ func TestGetPanelImage_TextBase64_RejectsOversizedPayload(t *testing.T) {
 	const chunkSize = 64 * 1024
 	chunk := bytes.Repeat([]byte{0x89}, chunkSize)
 
-	// Serve textBase64MaxImageBytes+1 bytes so the guard trips.
+	// Serve textBase64MaxImageBytes+1 bytes starting with PNG magic, so
+	// the size guard (not the magic-byte guard) is what trips.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		w.WriteHeader(http.StatusOK)
-		remaining := textBase64MaxImageBytes + 1
+		_, _ = w.Write([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A})
+		remaining := textBase64MaxImageBytes + 1 - 8
 		for remaining > 0 {
 			n := chunkSize
 			if remaining < n {
@@ -883,10 +885,68 @@ func TestGetPanelImage_TextBase64_RejectsOversizedPayload(t *testing.T) {
 	// contract.)
 }
 
+// TestGetPanelImage_TextBase64_RejectsNonPNGBody verifies the magic-byte
+// guard fires when upstream lies about the Content-Type. A server serving
+// HTML/error pages with a missing or wrong Content-Type would otherwise
+// pass the MIME check (parseImageMIME falls back to image/png) and reach
+// the model as "PNG bytes".
+func TestGetPanelImage_TextBase64_RejectsNonPNGBody(t *testing.T) {
+	htmlBody := []byte("<!DOCTYPE html><html><body>not a png</body></html>")
+	// Intentionally omit Content-Type so parseImageMIME's fallback kicks
+	// in; the magic-byte check must still catch this.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(htmlBody)
+	}))
+	defer server.Close()
+
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL:    server.URL,
+		APIKey: "test-api-key",
+	})
+
+	_, err := getPanelImage(ctx, GetPanelImageParams{
+		DashboardUID: "test-dash",
+		OutputFormat: stringPtr("text_base64"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a PNG")
+}
+
+// TestHasPNGSignature covers the magic-byte helper directly, including the
+// nil/short-input edge cases where the byte slice is shorter than the
+// 8-byte signature.
+func TestHasPNGSignature(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []byte
+		want bool
+	}{
+		{name: "valid PNG magic", in: []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 'I', 'H', 'D', 'R'}, want: true},
+		{name: "exactly 8 bytes of magic", in: []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, want: true},
+		{name: "wrong first byte", in: []byte{0x88, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, want: false},
+		{name: "HTML", in: []byte("<html>"), want: false},
+		{name: "JPEG magic", in: []byte{0xFF, 0xD8, 0xFF, 0xE0}, want: false},
+		{name: "too short", in: []byte{0x89, 'P', 'N', 'G'}, want: false},
+		{name: "empty", in: []byte{}, want: false},
+		{name: "nil", in: nil, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, hasPNGSignature(tt.in))
+		})
+	}
+}
+
 // TestGetPanelImage_TextBase64_AllowsPayloadAtLimit confirms the size guard
 // is "exceeds", not "at or exceeds" — exactly-at-limit renders must succeed.
 func TestGetPanelImage_TextBase64_AllowsPayloadAtLimit(t *testing.T) {
-	atLimit := bytes.Repeat([]byte{0x89}, textBase64MaxImageBytes)
+	// Prefix with the real PNG magic so the bytes actually look like a
+	// PNG — otherwise the magic-byte guard (which runs alongside the
+	// size guard) would reject this first and hide a regression in the
+	// size check.
+	atLimit := make([]byte, textBase64MaxImageBytes)
+	copy(atLimit, []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A})
 	server := newImageServer(t, atLimit, "image/png")
 	defer server.Close()
 
