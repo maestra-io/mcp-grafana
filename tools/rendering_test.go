@@ -961,6 +961,15 @@ func TestGetPanelImage_TextBase64_AllowsPayloadAtLimit(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, result.Content, 1)
+	// Prove the at-limit render round-trips cleanly, not just that
+	// an error isn't returned — a regression that swapped TextContent
+	// for another shape, or corrupted the base64, would otherwise slip
+	// through the size-guard test.
+	txt, ok := result.Content[0].(mcp.TextContent)
+	require.True(t, ok, "content must be TextContent at size boundary, got %T", result.Content[0])
+	decoded, err := base64.StdEncoding.DecodeString(txt.Text)
+	require.NoError(t, err)
+	assert.Equal(t, atLimit, decoded)
 }
 
 // TestGetPanelImage_PanelURIIncludesPanelID ensures EmbeddedResource URIs for
