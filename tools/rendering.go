@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -29,7 +30,26 @@ const (
 	outputFormatImage    = "image"    // single ImageContent; legacy/default shape
 	outputFormatResource = "resource" // single EmbeddedResource with a BlobResourceContents
 	outputFormatBoth     = "both"     // both blocks (image for inline display, resource for out-of-band bytes)
-	outputFormatDefault  = outputFormatImage
+	// outputFormatTextBase64 returns a single TextContent block with just
+	// the base64-encoded PNG bytes and nothing else. Motivation: Claude
+	// Code surfaces ImageContent (and image/* EmbeddedResource blobs) as
+	// images to the user and as vision input to the model, but hides the
+	// base64 string from the model's text context — so a skill that
+	// wants the model to decode the bytes to disk via Bash/Write has no
+	// way to see them. TextContent is passed through as text, which
+	// closes that gap. Behavior on non-Claude-Code clients is
+	// client-specific: some (Cursor, Zed, Claude Desktop) will render the
+	// raw base64 verbatim in the transcript, which is hostile to humans —
+	// callers on those clients should stick to 'image'/'resource'/'both'.
+	//
+	// Cost: the base64 rides back through the model's output window,
+	// which means the model must re-emit it (Write tool content or Bash
+	// heredoc) to land bytes on disk. Enforced upper bound is
+	// textBase64MaxImageBytes; practical limit is lower on models with
+	// smaller max_output_tokens. Use only for single-panel screenshots,
+	// not full-dashboard captures.
+	outputFormatTextBase64 = "text_base64"
+	outputFormatDefault    = outputFormatImage
 )
 
 // renderResponseLimitBytes caps how much we'll read from the Grafana
@@ -40,6 +60,14 @@ const (
 // dashboards rarely exceed ~2MiB even at scale=3, so 25MiB leaves
 // plenty of headroom while still bounding blast radius.
 const renderResponseLimitBytes = 25 * 1024 * 1024 // 25 MiB
+
+// textBase64MaxImageBytes caps the raw-image size accepted by the
+// text_base64 output path. The mode requires the model to emit the full
+// base64 string in a single output turn (→ Write/Bash), so a too-large
+// payload gets silently truncated by the model's output cap and a
+// corrupted file lands on disk. Prefer a hard server-side error with a
+// clear remediation hint over that silent failure mode.
+const textBase64MaxImageBytes = 512 * 1024 // 512 KiB (~683 KiB base64)
 
 // StringOrSlice is a type that can be unmarshaled from either a JSON string
 // or an array of strings. This allows dashboard variables to support both
@@ -96,7 +124,7 @@ type GetPanelImageParams struct {
 	Theme        *string                  `json:"theme,omitempty" jsonschema:"description=Theme for the rendered image: light or dark. Defaults to dark"`
 	Scale        *int                     `json:"scale,omitempty" jsonschema:"description=Scale factor for the image (1-3). Defaults to 1"`
 	Timeout      *int                     `json:"timeout,omitempty" jsonschema:"description=Rendering timeout in seconds. Defaults to 60"`
-	OutputFormat *string                  `json:"outputFormat,omitempty" jsonschema:"enum=image,enum=resource,enum=both,default=image,description=How to package the rendered bytes. 'image' (default) returns a single MCP ImageContent block for backward compatibility. 'resource' returns an EmbeddedResource with a BlobResourceContents blob - useful for clients or tooling that cannot decode inline ImageContent payloads. 'both' returns both content blocks so the model can display the image inline while out-of-band scripts recover the raw bytes from the resource. Note that 'both' roughly doubles response size."`
+	OutputFormat *string                  `json:"outputFormat,omitempty" jsonschema:"enum=image,enum=resource,enum=both,enum=text_base64,default=image,description=How to package the rendered bytes. 'image' (default) returns a single MCP ImageContent block for backward compatibility. 'resource' returns an EmbeddedResource with a BlobResourceContents blob - useful for clients or tooling that cannot decode inline ImageContent payloads. 'both' returns both content blocks so the model can display the image inline while out-of-band scripts recover the raw bytes from the resource. 'text_base64' returns a single TextContent block with only the base64 bytes as plain text - use this when the caller needs to pipe the image through a Bash/Write step to land on disk (ImageContent/EmbeddedResource blobs are rendered as images by most MCP clients and are not accessible to the model as text). Note that 'both' roughly doubles response size and 'text_base64' consumes real output tokens."`
 }
 
 type RenderTimeRange struct {
@@ -209,7 +237,56 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 
 	mimeType := parseImageMIME(resp.Header.Get("Content-Type"))
 
+	// text_base64 is explicitly advertised as "base64 PNG bytes" in the
+	// tool description; the model will name the output file .png. Reject
+	// non-PNG upstream responses rather than silently emitting bytes a
+	// caller will misidentify. We enforce this with two independent
+	// checks because neither alone is enough:
+	//
+	//   1. Content-Type header must be image/png. Catches proxies that
+	//      serve a different image format (image/jpeg, image/webp).
+	//   2. Magic-byte check on the body itself. Catches upstreams that
+	//      serve HTML/error pages with a missing or wrong Content-Type
+	//      (parseImageMIME falls back to "image/png" when the header is
+	//      absent or malformed, so the first check alone would pass).
+	if outputFormat == outputFormatTextBase64 {
+		if resp.Header.Get("Content-Type") != "" && mimeType != "image/png" {
+			return nil, fmt.Errorf(
+				"outputFormat=text_base64 requires Grafana to return image/png; got %q", mimeType,
+			)
+		}
+		if !hasPNGSignature(imageData) {
+			return nil, fmt.Errorf(
+				"outputFormat=text_base64 requires PNG bytes; response body is not a PNG (got Content-Type %q)",
+				resp.Header.Get("Content-Type"),
+			)
+		}
+	}
+	// Keep the text_base64 payload small enough that a reasonable Claude
+	// output window can actually emit it back to a Write/Bash step. 512KiB
+	// of raw PNG → ~683KiB of base64 → ~170K tokens at ~4 chars/token on a
+	// base64 alphabet, which is already above a typical 64K output cap
+	// but lets the guard catch obvious misuse (full-dashboard renders)
+	// without false-positive-ing single-panel screenshots.
+	if outputFormat == outputFormatTextBase64 && len(imageData) > textBase64MaxImageBytes {
+		return nil, fmt.Errorf(
+			"outputFormat=text_base64 payload exceeds %d-byte limit (got %d); reduce width/height/scale or switch to outputFormat=image/resource",
+			textBase64MaxImageBytes, len(imageData),
+		)
+	}
+
 	return buildPanelImageResult(args, outputFormat, mimeType, imageData), nil
+}
+
+// pngSignature is the 8-byte ISO/IEC 15948 PNG magic header, as defined
+// in https://www.w3.org/TR/PNG/#5PNG-file-signature.
+var pngSignature = []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
+
+// hasPNGSignature reports whether data begins with the PNG magic bytes.
+// Used by the text_base64 output path to fail fast on responses that
+// pretend to be PNG (via Content-Type) but aren't.
+func hasPNGSignature(data []byte) bool {
+	return len(data) >= len(pngSignature) && bytes.Equal(data[:len(pngSignature)], pngSignature)
 }
 
 // parseImageMIME extracts the media type (no params) from a Content-Type
@@ -243,12 +320,12 @@ func resolveOutputFormat(raw *string) (string, error) {
 		return outputFormatDefault, nil
 	}
 	switch *raw {
-	case outputFormatImage, outputFormatResource, outputFormatBoth:
+	case outputFormatImage, outputFormatResource, outputFormatBoth, outputFormatTextBase64:
 		return *raw, nil
 	default:
 		return "", fmt.Errorf(
-			"invalid outputFormat %q: expected one of %q, %q, %q",
-			*raw, outputFormatImage, outputFormatResource, outputFormatBoth,
+			"invalid outputFormat %q: expected one of %q, %q, %q, %q",
+			*raw, outputFormatImage, outputFormatResource, outputFormatBoth, outputFormatTextBase64,
 		)
 	}
 }
@@ -298,6 +375,16 @@ func buildPanelImageResult(args GetPanelImageParams, outputFormat, mimeType stri
 				MIMEType: mimeType,
 				Blob:     base64Data,
 			},
+		})
+	}
+	if outputFormat == outputFormatTextBase64 {
+		// Emit ONLY the base64 string, with no surrounding wrapper or
+		// prose. The caller is expected to read this verbatim into a
+		// Bash/script step (e.g. `base64 -d > file.png`), so any extra
+		// characters would corrupt the decoded output.
+		contents = append(contents, mcp.TextContent{
+			Type: "text",
+			Text: base64Data,
 		})
 	}
 

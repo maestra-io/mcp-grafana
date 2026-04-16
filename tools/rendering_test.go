@@ -569,6 +569,7 @@ func TestResolveOutputFormat(t *testing.T) {
 		{name: "image literal", input: stringPtr("image"), want: outputFormatImage},
 		{name: "resource literal", input: stringPtr("resource"), want: outputFormatResource},
 		{name: "both literal", input: stringPtr("both"), want: outputFormatBoth},
+		{name: "text_base64 literal", input: stringPtr("text_base64"), want: outputFormatTextBase64},
 		// Schema advertises lowercase only; we reject deviations so a
 		// client that validates against the enum sees the same behavior
 		// as the server. Explicit "" is a caller bug, not a "don't care"
@@ -708,6 +709,27 @@ func TestGetPanelImage_OutputFormats(t *testing.T) {
 		assert.Equal(t, wantB64, blob.Blob)
 	}
 
+	assertTextBase64 := func(t *testing.T, result *mcp.CallToolResult) {
+		t.Helper()
+		require.Len(t, result.Content, 1, "text_base64 must emit exactly one TextContent block")
+		txt, ok := result.Content[0].(mcp.TextContent)
+		require.True(t, ok, "content must be TextContent, got %T", result.Content[0])
+		assert.Equal(t, "text", txt.Type)
+		// Must be ONLY the base64 — no prefix, suffix, or wrapper. Any
+		// stray characters would corrupt a downstream `base64 -d` pipe.
+		assert.Equal(t, wantB64, txt.Text)
+		// No line wrapping either — the shell pipe uses single-line input.
+		assert.NotContains(t, txt.Text, "\n", "base64 must be single-line for shell pipe")
+		assert.NotContains(t, txt.Text, "\r", "base64 must be single-line for shell pipe")
+		// Annotations deliberately left nil: MCP annotations are hints,
+		// and a client that interprets audience=[assistant] as "drop
+		// from context" would silently defeat the whole point of this
+		// mode. Pin the default-audience contract so a future maintainer
+		// doesn't "fix" the asymmetry by copy-pasting the image/resource
+		// annotations onto this branch.
+		assert.Nil(t, txt.Annotations, "TextContent must use default audience so the model reliably sees the base64")
+	}
+
 	cases := []struct {
 		name   string
 		format *string
@@ -717,6 +739,7 @@ func TestGetPanelImage_OutputFormats(t *testing.T) {
 		{name: "explicit image", format: stringPtr("image"), check: assertImageOnly},
 		{name: "resource only", format: stringPtr("resource"), check: assertResourceOnly},
 		{name: "both", format: stringPtr("both"), check: assertBoth},
+		{name: "text_base64", format: stringPtr("text_base64"), check: assertTextBase64},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -760,6 +783,187 @@ func TestGetPanelImage_InvalidOutputFormat(t *testing.T) {
 	assert.Contains(t, err.Error(), "image")
 	assert.Contains(t, err.Error(), "resource")
 	assert.Contains(t, err.Error(), "both")
+	assert.Contains(t, err.Error(), "text_base64")
+}
+
+// TestGetPanelImage_TextBase64_DecodesToOriginalBytes locks in the contract
+// that callers rely on when they pipe the returned text through `base64 -d`:
+// the TextContent.Text field must be exactly the base64 encoding of the
+// image bytes, with no prose, prefix, or trailing whitespace that would
+// make the decoded output garbage.
+func TestGetPanelImage_TextBase64_DecodesToOriginalBytes(t *testing.T) {
+	testPNGData := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xde, 0xad, 0xbe, 0xef}
+	server := newImageServer(t, testPNGData, "image/png")
+	defer server.Close()
+
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL:    server.URL,
+		APIKey: "test-api-key",
+	})
+
+	result, err := getPanelImage(ctx, GetPanelImageParams{
+		DashboardUID: "test-dash",
+		OutputFormat: stringPtr("text_base64"),
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Content, 1)
+
+	txt := result.Content[0].(mcp.TextContent)
+	decoded, err := base64.StdEncoding.DecodeString(txt.Text)
+	require.NoError(t, err, "TextContent.Text must be plain base64 with no wrapper")
+	assert.Equal(t, testPNGData, decoded)
+}
+
+// TestGetPanelImage_TextBase64_RejectsNonPNG verifies that text_base64 refuses
+// to silently hand the model bytes for a non-PNG content type. The mode is
+// documented as returning PNG bytes; a caller decoding with `base64 -d >
+// render.png` would otherwise save a JPEG under a .png filename.
+func TestGetPanelImage_TextBase64_RejectsNonPNG(t *testing.T) {
+	testJPEGData := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46}
+	server := newImageServer(t, testJPEGData, "image/jpeg")
+	defer server.Close()
+
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL:    server.URL,
+		APIKey: "test-api-key",
+	})
+
+	_, err := getPanelImage(ctx, GetPanelImageParams{
+		DashboardUID: "test-dash",
+		OutputFormat: stringPtr("text_base64"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "image/png")
+	assert.Contains(t, err.Error(), "image/jpeg")
+}
+
+// TestGetPanelImage_TextBase64_RejectsOversizedPayload verifies that the mode
+// refuses payloads large enough to blow past the model's output token window
+// on the return trip. Silent truncation there would corrupt the written file
+// with no error signal, which is worse than a clean server-side error.
+func TestGetPanelImage_TextBase64_RejectsOversizedPayload(t *testing.T) {
+	const chunkSize = 64 * 1024
+	chunk := bytes.Repeat([]byte{0x89}, chunkSize)
+
+	// Serve textBase64MaxImageBytes+1 bytes starting with PNG magic, so
+	// the size guard (not the magic-byte guard) is what trips.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A})
+		remaining := textBase64MaxImageBytes + 1 - 8
+		for remaining > 0 {
+			n := chunkSize
+			if remaining < n {
+				n = remaining
+			}
+			if _, err := w.Write(chunk[:n]); err != nil {
+				return
+			}
+			remaining -= n
+		}
+	}))
+	defer server.Close()
+
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL:    server.URL,
+		APIKey: "test-api-key",
+	})
+
+	_, err := getPanelImage(ctx, GetPanelImageParams{
+		DashboardUID: "test-dash",
+		OutputFormat: stringPtr("text_base64"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "text_base64")
+	assert.Contains(t, err.Error(), "exceeds")
+}
+
+// TestGetPanelImage_TextBase64_RejectsNonPNGBody verifies the magic-byte
+// guard fires when upstream lies about the Content-Type. A server serving
+// HTML/error pages with a missing or wrong Content-Type would otherwise
+// pass the MIME check (parseImageMIME falls back to image/png) and reach
+// the model as "PNG bytes".
+func TestGetPanelImage_TextBase64_RejectsNonPNGBody(t *testing.T) {
+	htmlBody := []byte("<!DOCTYPE html><html><body>not a png</body></html>")
+	// Intentionally omit Content-Type so parseImageMIME's fallback kicks
+	// in; the magic-byte check must still catch this.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(htmlBody)
+	}))
+	defer server.Close()
+
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL:    server.URL,
+		APIKey: "test-api-key",
+	})
+
+	_, err := getPanelImage(ctx, GetPanelImageParams{
+		DashboardUID: "test-dash",
+		OutputFormat: stringPtr("text_base64"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a PNG")
+}
+
+// TestHasPNGSignature covers the magic-byte helper directly, including the
+// nil/short-input edge cases where the byte slice is shorter than the
+// 8-byte signature.
+func TestHasPNGSignature(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []byte
+		want bool
+	}{
+		{name: "valid PNG magic", in: []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 'I', 'H', 'D', 'R'}, want: true},
+		{name: "exactly 8 bytes of magic", in: []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, want: true},
+		{name: "wrong first byte", in: []byte{0x88, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, want: false},
+		{name: "HTML", in: []byte("<html>"), want: false},
+		{name: "JPEG magic", in: []byte{0xFF, 0xD8, 0xFF, 0xE0}, want: false},
+		{name: "too short", in: []byte{0x89, 'P', 'N', 'G'}, want: false},
+		{name: "empty", in: []byte{}, want: false},
+		{name: "nil", in: nil, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, hasPNGSignature(tt.in))
+		})
+	}
+}
+
+// TestGetPanelImage_TextBase64_AllowsPayloadAtLimit confirms the size guard
+// is "exceeds", not "at or exceeds" — exactly-at-limit renders must succeed.
+func TestGetPanelImage_TextBase64_AllowsPayloadAtLimit(t *testing.T) {
+	// Prefix with the real PNG magic so the bytes actually look like a
+	// PNG — otherwise the magic-byte guard (which runs alongside the
+	// size guard) would reject this first and hide a regression in the
+	// size check.
+	atLimit := make([]byte, textBase64MaxImageBytes)
+	copy(atLimit, []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A})
+	server := newImageServer(t, atLimit, "image/png")
+	defer server.Close()
+
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL:    server.URL,
+		APIKey: "test-api-key",
+	})
+
+	result, err := getPanelImage(ctx, GetPanelImageParams{
+		DashboardUID: "test-dash",
+		OutputFormat: stringPtr("text_base64"),
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Content, 1)
+	// Prove the at-limit render round-trips cleanly, not just that
+	// an error isn't returned — a regression that swapped TextContent
+	// for another shape, or corrupted the base64, would otherwise slip
+	// through the size-guard test.
+	txt, ok := result.Content[0].(mcp.TextContent)
+	require.True(t, ok, "content must be TextContent at size boundary, got %T", result.Content[0])
+	decoded, err := base64.StdEncoding.DecodeString(txt.Text)
+	require.NoError(t, err)
+	assert.Equal(t, atLimit, decoded)
 }
 
 // TestGetPanelImage_PanelURIIncludesPanelID ensures EmbeddedResource URIs for
@@ -977,6 +1181,7 @@ func TestGetPanelImageParams_UnmarshalOutputFormat(t *testing.T) {
 		{name: "image", input: `{"dashboardUid":"x","outputFormat":"image"}`, want: stringPtr("image")},
 		{name: "resource", input: `{"dashboardUid":"x","outputFormat":"resource"}`, want: stringPtr("resource")},
 		{name: "both", input: `{"dashboardUid":"x","outputFormat":"both"}`, want: stringPtr("both")},
+		{name: "text_base64", input: `{"dashboardUid":"x","outputFormat":"text_base64"}`, want: stringPtr("text_base64")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
