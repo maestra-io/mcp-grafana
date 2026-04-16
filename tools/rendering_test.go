@@ -877,12 +877,6 @@ func TestGetPanelImage_TextBase64_RejectsOversizedPayload(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "text_base64")
 	assert.Contains(t, err.Error(), "exceeds")
-	// Same oversized body on a non-text_base64 path should succeed — the
-	// guard is mode-specific, not a blanket size cap.
-	//
-	// (That side is already covered by TestGetPanelImage_OutputFormats;
-	// assertion kept local to keep this test focused on the text_base64
-	// contract.)
 }
 
 // TestGetPanelImage_TextBase64_RejectsNonPNGBody verifies the magic-byte
