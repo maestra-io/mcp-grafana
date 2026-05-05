@@ -16,28 +16,36 @@ import (
 
 // GetAnnotationsInput filters annotation search.
 type GetAnnotationsInput struct {
-	From         *int64   `json:"from,omitempty" jsonschema:"description=Epoch ms start time"`
-	To           *int64   `json:"to,omitempty" jsonschema:"description=Epoch ms end time"`
-	Limit        *int64   `json:"limit,omitempty" jsonschema:"description=Max results default 100"`
-	AlertUID     *string  `json:"alertUid,omitempty" jsonschema:"description=Filter by alert UID"`
-	DashboardUID *string  `json:"dashboardUid,omitempty" jsonschema:"description=Filter by dashboard UID"`
-	PanelID      *int64   `json:"panelId,omitempty" jsonschema:"description=Filter by panel ID"`
-	UserID       *int64   `json:"userId,omitempty" jsonschema:"description=Filter by creator user ID"`
-	Type         *string  `json:"type,omitempty" jsonschema:"description=annotation or alert"`
-	Tags         []string `json:"tags,omitempty" jsonschema:"description=Filter by tags. Multiple tags allowed; use matchAny to control AND/OR logic"`
-	MatchAny     *bool    `json:"matchAny,omitempty" jsonschema:"description=If true\\, match any tag (OR). If false\\, match all tags (AND). Default: false"`
+	From         *int64  `json:"from,omitempty" jsonschema:"description=Epoch ms start time"`
+	To           *int64  `json:"to,omitempty" jsonschema:"description=Epoch ms end time"`
+	Limit        *int64  `json:"limit,omitempty" jsonschema:"description=Max results default 100"`
+	AlertUID     *string `json:"alertUid,omitempty" jsonschema:"description=Filter by alert UID"`
+	DashboardUID *string `json:"dashboardUid,omitempty" jsonschema:"description=Filter by dashboard UID"`
+	// LegacyDashboardUID accepts the pre-rename JSON key dashboardUID for
+	// backward compatibility with existing clients. Not surfaced in the
+	// tool's JSON schema.
+	LegacyDashboardUID *string  `json:"dashboardUID,omitempty" jsonschema:"-"`
+	PanelID            *int64   `json:"panelId,omitempty" jsonschema:"description=Filter by panel ID"`
+	UserID             *int64   `json:"userId,omitempty" jsonschema:"description=Filter by creator user ID"`
+	Type               *string  `json:"type,omitempty" jsonschema:"description=annotation or alert"`
+	Tags               []string `json:"tags,omitempty" jsonschema:"description=Filter by tags. Multiple tags allowed; use matchAny to control AND/OR logic"`
+	MatchAny           *bool    `json:"matchAny,omitempty" jsonschema:"description=If true\\, match any tag (OR). If false\\, match all tags (AND). Default: false"`
 }
 
 // getAnnotations retrieves Grafana annotations using filters.
 func getAnnotations(ctx context.Context, args GetAnnotationsInput) (*annotations.GetAnnotationsOK, error) {
 	c := mcpgrafana.GrafanaClientFromContext(ctx)
 
+	dashboardUID := args.DashboardUID
+	if dashboardUID == nil {
+		dashboardUID = args.LegacyDashboardUID
+	}
 	req := annotations.GetAnnotationsParams{
 		From:         args.From,
 		To:           args.To,
 		Limit:        args.Limit,
 		AlertUID:     args.AlertUID,
-		DashboardUID: args.DashboardUID,
+		DashboardUID: dashboardUID,
 		PanelID:      args.PanelID,
 		UserID:       args.UserID,
 		Type:         args.Type,

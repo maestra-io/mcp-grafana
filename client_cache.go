@@ -77,6 +77,27 @@ func (k clientCacheKey) String() string {
 	return fmt.Sprintf("url=%s apiKey=%t basicAuth=%t orgID=%d forwardedHeaders=%t", k.url, hasKey, hasBasic, k.orgID, hasFwd)
 }
 
+// singleflightKey returns a stable, collision-resistant key for use with
+// singleflight.Group.Do. We can't reuse String() because it intentionally
+// redacts credential values for logging — different api keys, passwords, or
+// forwarded-header digests would collapse into the same singleflight bucket
+// whenever url+orgID+presence-flags happened to match, letting one request's
+// concurrent miss receive a client built with another request's credentials.
+// The digest is a SHA-256 of the length-prefixed pairs of all key fields.
+func (k clientCacheKey) singleflightKey() string {
+	h := sha256.New()
+	writePart := func(s string) {
+		_, _ = fmt.Fprintf(h, "%d:%s", len(s), s)
+	}
+	writePart(k.url)
+	writePart(k.apiKey)
+	writePart(k.username)
+	writePart(k.password)
+	_, _ = fmt.Fprintf(h, "%d:", k.orgID)
+	writePart(k.forwardedHeaders)
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
 // clientCacheMetrics holds OTel instruments for cache observability.
 type clientCacheMetrics struct {
 	lookups metric.Int64Counter // Total lookups (hits + misses)
@@ -163,10 +184,10 @@ func (c *ClientCache) GetOrCreateGrafanaClient(key clientCacheKey, createFn func
 	c.mu.RUnlock()
 
 	// Slow path: use singleflight to create outside the lock,
-	// deduplicating concurrent requests for the same key.
-	// Use fmt.Sprintf("%v", key) for the singleflight key to include actual
-	// credential values (the struct fields), not the redacted String() output.
-	sfKey := fmt.Sprintf("%v", key)
+	// deduplicating concurrent requests for the same key. We can't use the
+	// Stringer here — it redacts credential values, which would collide
+	// across different api keys/basic auth/forwarded headers.
+	sfKey := key.singleflightKey()
 	val, _, _ := c.sfGrafana.Do(sfKey, func() (any, error) {
 		// Double-check after winning the singleflight race
 		c.mu.RLock()
@@ -212,7 +233,7 @@ func (c *ClientCache) GetOrCreateIncidentClient(key clientCacheKey, createFn fun
 	c.mu.RUnlock()
 
 	// Slow path: use singleflight to create outside the lock
-	sfKey := fmt.Sprintf("%v", key)
+	sfKey := key.singleflightKey()
 	val, _, _ := c.sfIncident.Do(sfKey, func() (any, error) {
 		c.mu.RLock()
 		if client, ok := c.incidentClients[key]; ok {

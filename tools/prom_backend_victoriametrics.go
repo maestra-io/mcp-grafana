@@ -70,6 +70,9 @@ func (b *victoriaMetricsBackend) Query(ctx context.Context, expr string, queryTy
 	}
 
 	step := stepSeconds
+	if step < 0 {
+		return nil, fmt.Errorf("stepSeconds must be >= 0, got %d", step)
+	}
 	if step == 0 {
 		step = 60
 	}
