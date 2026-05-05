@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"sync"
 
 	"github.com/grafana/incident-go"
@@ -18,17 +19,18 @@ import (
 
 const clientCacheMeterName = "mcp-grafana"
 
-// clientCacheKey uniquely identifies a client by its credentials and target.
+// clientCacheKey uniquely identifies a client by its credentials, target, and forwarded headers.
 type clientCacheKey struct {
-	url      string
-	apiKey   string
-	username string
-	password string
-	orgID    int64
+	url              string
+	apiKey           string
+	username         string
+	password         string
+	orgID            int64
+	forwardedHeaders string // sorted, serialized forwarded headers for cache differentiation
 }
 
-// cacheKeyFromRequest builds a clientCacheKey from request-derived credentials.
-func cacheKeyFromRequest(grafanaURL, apiKey string, basicAuth *url.Userinfo, orgID int64) clientCacheKey {
+// cacheKeyFromRequest builds a clientCacheKey from request-derived credentials and forwarded headers.
+func cacheKeyFromRequest(grafanaURL, apiKey string, basicAuth *url.Userinfo, orgID int64, req *http.Request) clientCacheKey {
 	key := clientCacheKey{
 		url:    grafanaURL,
 		apiKey: apiKey,
@@ -38,14 +40,62 @@ func cacheKeyFromRequest(grafanaURL, apiKey string, basicAuth *url.Userinfo, org
 		key.username = basicAuth.Username()
 		key.password, _ = basicAuth.Password()
 	}
+	if req != nil {
+		key.forwardedHeaders = forwardedHeadersDigest(forwardedHeadersFromRequest(req))
+	}
 	return key
 }
 
+// forwardedHeadersDigest returns a length-prefixed SHA-256 of the sorted
+// header pairs so that the resulting string (a) cannot collide between
+// different header sets containing `=` or `,` in their values, and (b) is
+// safe to surface in debug logs (no raw header values leak).
+func forwardedHeadersDigest(headers map[string]string) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(headers))
+	for k := range headers {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	h := sha256.New()
+	for _, k := range names {
+		v := headers[k]
+		_, _ = fmt.Fprintf(h, "%d:%s%d:%s", len(k), k, len(v), v)
+	}
+	return fmt.Sprintf("sha256:%x", h.Sum(nil))
+}
+
 // String returns a redacted string representation for logging.
+// forwardedHeaders is already a digest; we expose only the count of forwarded
+// headers and the digest itself to avoid leaking sensitive request data.
 func (k clientCacheKey) String() string {
 	hasKey := k.apiKey != ""
 	hasBasic := k.username != ""
-	return fmt.Sprintf("url=%s apiKey=%t basicAuth=%t orgID=%d", k.url, hasKey, hasBasic, k.orgID)
+	hasFwd := k.forwardedHeaders != ""
+	return fmt.Sprintf("url=%s apiKey=%t basicAuth=%t orgID=%d forwardedHeaders=%t", k.url, hasKey, hasBasic, k.orgID, hasFwd)
+}
+
+// singleflightKey returns a stable, collision-resistant key for use with
+// singleflight.Group.Do. We can't reuse String() because it intentionally
+// redacts credential values for logging — different api keys, passwords, or
+// forwarded-header digests would collapse into the same singleflight bucket
+// whenever url+orgID+presence-flags happened to match, letting one request's
+// concurrent miss receive a client built with another request's credentials.
+// The digest is a SHA-256 of the length-prefixed pairs of all key fields.
+func (k clientCacheKey) singleflightKey() string {
+	h := sha256.New()
+	writePart := func(s string) {
+		_, _ = fmt.Fprintf(h, "%d:%s", len(s), s)
+	}
+	writePart(k.url)
+	writePart(k.apiKey)
+	writePart(k.username)
+	writePart(k.password)
+	_, _ = fmt.Fprintf(h, "%d:", k.orgID)
+	writePart(k.forwardedHeaders)
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // clientCacheMetrics holds OTel instruments for cache observability.
@@ -99,14 +149,19 @@ type ClientCache struct {
 	metrics         clientCacheMetrics
 	sfGrafana       singleflight.Group
 	sfIncident      singleflight.Group
+	logger          *slog.Logger
 }
 
 // NewClientCache creates a new client cache.
-func NewClientCache() *ClientCache {
+func NewClientCache(logger *slog.Logger) *ClientCache {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &ClientCache{
 		grafanaClients:  make(map[clientCacheKey]*GrafanaClient),
 		incidentClients: make(map[clientCacheKey]*incident.Client),
 		metrics:         newClientCacheMetrics(),
+		logger:          logger,
 	}
 }
 
@@ -129,10 +184,10 @@ func (c *ClientCache) GetOrCreateGrafanaClient(key clientCacheKey, createFn func
 	c.mu.RUnlock()
 
 	// Slow path: use singleflight to create outside the lock,
-	// deduplicating concurrent requests for the same key.
-	// Use fmt.Sprintf("%v", key) for the singleflight key to include actual
-	// credential values (the struct fields), not the redacted String() output.
-	sfKey := fmt.Sprintf("%v", key)
+	// deduplicating concurrent requests for the same key. We can't use the
+	// Stringer here — it redacts credential values, which would collide
+	// across different api keys/basic auth/forwarded headers.
+	sfKey := key.singleflightKey()
 	val, _, _ := c.sfGrafana.Do(sfKey, func() (any, error) {
 		// Double-check after winning the singleflight race
 		c.mu.RLock()
@@ -145,14 +200,17 @@ func (c *ClientCache) GetOrCreateGrafanaClient(key clientCacheKey, createFn func
 		// Create the client without holding any lock
 		client := createFn()
 
-		// Store the result
+		// Store the result. Capture the post-insert size while still holding
+		// the lock, then unlock before logging so synchronous log writes
+		// don't queue cache traffic behind us.
 		c.mu.Lock()
 		c.grafanaClients[key] = client
 		c.metrics.misses.Add(ctx, 1, typeAttr)
-		c.metrics.size.Record(ctx, int64(len(c.grafanaClients)), typeAttr)
-		slog.Debug("Cached new Grafana client", "key", key, "cache_size", len(c.grafanaClients))
+		size := len(c.grafanaClients)
+		c.metrics.size.Record(ctx, int64(size), typeAttr)
 		c.mu.Unlock()
 
+		c.logger.Debug("Cached new Grafana client", "key", key, "cache_size", size)
 		return client, nil
 	})
 
@@ -178,7 +236,7 @@ func (c *ClientCache) GetOrCreateIncidentClient(key clientCacheKey, createFn fun
 	c.mu.RUnlock()
 
 	// Slow path: use singleflight to create outside the lock
-	sfKey := fmt.Sprintf("%v", key)
+	sfKey := key.singleflightKey()
 	val, _, _ := c.sfIncident.Do(sfKey, func() (any, error) {
 		c.mu.RLock()
 		if client, ok := c.incidentClients[key]; ok {
@@ -192,10 +250,11 @@ func (c *ClientCache) GetOrCreateIncidentClient(key clientCacheKey, createFn fun
 		c.mu.Lock()
 		c.incidentClients[key] = client
 		c.metrics.misses.Add(ctx, 1, typeAttr)
-		c.metrics.size.Record(ctx, int64(len(c.incidentClients)), typeAttr)
-		slog.Debug("Cached new incident client", "key", key, "cache_size", len(c.incidentClients))
+		size := len(c.incidentClients)
+		c.metrics.size.Record(ctx, int64(size), typeAttr)
 		c.mu.Unlock()
 
+		c.logger.Debug("Cached new incident client", "key", key, "cache_size", size)
 		return client, nil
 	})
 
@@ -223,7 +282,7 @@ func (c *ClientCache) Close() {
 	ctx := context.Background()
 	c.metrics.size.Record(ctx, 0, metric.WithAttributes(attrClientTypeGrafana))
 	c.metrics.size.Record(ctx, 0, metric.WithAttributes(attrClientTypeIncident))
-	slog.Debug("Client cache closed")
+	c.logger.Debug("Client cache closed")
 }
 
 // Size returns the number of cached clients (for testing/metrics).
@@ -247,15 +306,16 @@ func hashAPIKey(key string) string {
 func extractGrafanaClientCached(cache *ClientCache) httpContextFunc {
 	return func(ctx context.Context, req *http.Request) context.Context {
 		config := GrafanaConfigFromContext(ctx)
+		logger := config.LoggerOrDefault()
 		if config.OrgID == 0 {
-			slog.Warn("No org ID found in request headers or environment variables, using default org. Set GRAFANA_ORG_ID or pass X-Grafana-Org-Id header to target a specific org.")
+			logger.Warn("No org ID found in request headers or environment variables, using default org. Set GRAFANA_ORG_ID or pass X-Grafana-Org-Id header to target a specific org.")
 		}
 
-		u, apiKey, basicAuth, _ := extractKeyGrafanaInfoFromReq(req)
-		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID)
+		u, apiKey, basicAuth, _ := extractKeyGrafanaInfoFromReq(req, logger)
+		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID, req)
 
 		grafanaClient := cache.GetOrCreateGrafanaClient(key, func() *GrafanaClient {
-			slog.Debug("Creating new Grafana client (cache miss)", "url", u, "api_key_hash", hashAPIKey(apiKey))
+			logger.Debug("Creating new Grafana client (cache miss)", "url", u, "api_key_hash", hashAPIKey(apiKey))
 			return NewGrafanaClient(ctx, u, apiKey, basicAuth)
 		})
 
@@ -266,21 +326,27 @@ func extractGrafanaClientCached(cache *ClientCache) httpContextFunc {
 // extractIncidentClientCached creates an httpContextFunc that uses the cache.
 func extractIncidentClientCached(cache *ClientCache) httpContextFunc {
 	return func(ctx context.Context, req *http.Request) context.Context {
-		grafanaURL, apiKey, _, orgID := extractKeyGrafanaInfoFromReq(req)
-		key := cacheKeyFromRequest(grafanaURL, apiKey, nil, orgID)
+		config := GrafanaConfigFromContext(ctx)
+		logger := config.LoggerOrDefault()
+
+		grafanaURL, apiKey, basicAuth, orgID := extractKeyGrafanaInfoFromReq(req, logger)
+		key := cacheKeyFromRequest(grafanaURL, apiKey, basicAuth, orgID, req)
 
 		incidentClient := cache.GetOrCreateIncidentClient(key, func() *incident.Client {
 			incidentURL := fmt.Sprintf("%s/api/plugins/grafana-irm-app/resources/api/v1/", grafanaURL)
-			slog.Debug("Creating new incident client (cache miss)", "url", incidentURL)
+			logger.Debug("Creating new incident client (cache miss)", "url", incidentURL)
 			client := incident.NewClient(incidentURL, apiKey)
 
-			config := GrafanaConfigFromContext(ctx)
+			config.OrgID = orgID
+			config.BasicAuth = basicAuth
+			// Don't disable auth: BuildTransport's auth round-tripper is the
+			// only path that injects basicAuth, and api-key callers also need
+			// the org-id / extra-headers / forwarded-headers layers.
 			transport, err := BuildTransport(&config, nil)
 			if err != nil {
-				slog.Error("Failed to create custom transport for incident client, using default", "error", err)
+				logger.Error("Failed to create custom transport for incident client, using default", "error", err)
 			} else {
-				orgIDWrapped := NewOrgIDRoundTripper(transport, orgID)
-				client.HTTPClient.Transport = wrapWithUserAgent(orgIDWrapped)
+				client.HTTPClient.Transport = transport
 			}
 
 			return client

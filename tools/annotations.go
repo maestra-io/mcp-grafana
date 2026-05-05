@@ -16,32 +16,38 @@ import (
 
 // GetAnnotationsInput filters annotation search.
 type GetAnnotationsInput struct {
-	From         *int64   `jsonschema:"description=Epoch ms start time"`
-	To           *int64   `jsonschema:"description=Epoch ms end time"`
-	Limit        *int64   `jsonschema:"description=Max results default 100"`
-	AlertID      *int64   `jsonschema:"description=Deprecated. Use AlertUID"`
-	AlertUID     *string  `jsonschema:"description=Filter by alert UID"`
-	DashboardID  *int64   `jsonschema:"description=Deprecated. Use DashboardUID"`
-	DashboardUID *string  `jsonschema:"description=Filter by dashboard UID"`
-	PanelID      *int64   `jsonschema:"description=Filter by panel ID"`
-	UserID       *int64   `jsonschema:"description=Filter by creator user ID"`
-	Type         *string  `jsonschema:"description=annotation or alert"`
-	Tags         []string `jsonschema:"description=Multiple tags allowed tags=tag1&tags=tag2"`
-	MatchAny     *bool    `jsonschema:"description=true OR tag match false AND"`
+	From         *int64  `json:"from,omitempty" jsonschema:"description=Epoch ms start time"`
+	To           *int64  `json:"to,omitempty" jsonschema:"description=Epoch ms end time"`
+	Limit        *int64  `json:"limit,omitempty" jsonschema:"description=Max results default 100"`
+	AlertUID     *string `json:"alertUid,omitempty" jsonschema:"description=Filter by alert UID"`
+	DashboardUID *string `json:"dashboardUid,omitempty" jsonschema:"description=Filter by dashboard UID"`
+	// LegacyDashboardUID accepts the pre-rename JSON key dashboardUID for
+	// backward compatibility with existing clients. Not surfaced in the
+	// tool's JSON schema.
+	LegacyDashboardUID *string  `json:"dashboardUID,omitempty" jsonschema:"-"`
+	PanelID            *int64   `json:"panelId,omitempty" jsonschema:"description=Filter by panel ID"`
+	UserID             *int64   `json:"userId,omitempty" jsonschema:"description=Filter by creator user ID"`
+	Type               *string  `json:"type,omitempty" jsonschema:"description=annotation or alert"`
+	Tags               []string `json:"tags,omitempty" jsonschema:"description=Filter by tags. Multiple tags allowed; use matchAny to control AND/OR logic"`
+	MatchAny           *bool    `json:"matchAny,omitempty" jsonschema:"description=If true\\, match any tag (OR). If false\\, match all tags (AND). Default: false"`
 }
 
 // getAnnotations retrieves Grafana annotations using filters.
 func getAnnotations(ctx context.Context, args GetAnnotationsInput) (*annotations.GetAnnotationsOK, error) {
 	c := mcpgrafana.GrafanaClientFromContext(ctx)
 
+	// Coalesce: nil OR empty-string both fall back to the legacy key,
+	// matching createAnnotation's empty-string handling.
+	dashboardUID := args.DashboardUID
+	if (dashboardUID == nil || *dashboardUID == "") && args.LegacyDashboardUID != nil {
+		dashboardUID = args.LegacyDashboardUID
+	}
 	req := annotations.GetAnnotationsParams{
 		From:         args.From,
 		To:           args.To,
 		Limit:        args.Limit,
-		AlertID:      args.AlertID,
 		AlertUID:     args.AlertUID,
-		DashboardID:  args.DashboardID,
-		DashboardUID: args.DashboardUID,
+		DashboardUID: dashboardUID,
 		PanelID:      args.PanelID,
 		UserID:       args.UserID,
 		Type:         args.Type,
@@ -69,14 +75,17 @@ var GetAnnotationsTool = mcpgrafana.MustTool(
 
 // CreateAnnotationInput creates a new annotation, optionally in Graphite format.
 type CreateAnnotationInput struct {
-	DashboardID  int64          `json:"dashboardId,omitempty"  jsonschema:"description=Deprecated. Use dashboardUID"`
-	DashboardUID string         `json:"dashboardUID,omitempty" jsonschema:"description=Preferred dashboard UID"`
-	PanelID      int64          `json:"panelId,omitempty"      jsonschema:"description=Panel ID"`
-	Time         int64          `json:"time,omitempty"         jsonschema:"description=Start time epoch ms"`
-	TimeEnd      int64          `json:"timeEnd,omitempty"      jsonschema:"description=End time epoch ms"`
-	Tags         []string       `json:"tags,omitempty"         jsonschema:"description=Optional list of tags"`
-	Text         string         `json:"text,omitempty"         jsonschema:"description=Annotation text (required unless format is graphite)"`
-	Data         map[string]any `json:"data,omitempty"         jsonschema:"description=Optional JSON payload"`
+	DashboardUID string `json:"dashboardUid,omitempty" jsonschema:"description=Dashboard UID"`
+	// LegacyDashboardUID accepts the pre-rename JSON key dashboardUID for
+	// backward compatibility with existing clients. Only DashboardUID is
+	// surfaced in the tool's JSON schema.
+	LegacyDashboardUID string         `json:"dashboardUID,omitempty" jsonschema:"-"`
+	PanelID            int64          `json:"panelId,omitempty"      jsonschema:"description=Panel ID"`
+	Time               int64          `json:"time,omitempty"         jsonschema:"description=Start time epoch ms"`
+	TimeEnd            int64          `json:"timeEnd,omitempty"      jsonschema:"description=End time epoch ms"`
+	Tags               []string       `json:"tags,omitempty"         jsonschema:"description=Optional list of tags"`
+	Text               string         `json:"text,omitempty"         jsonschema:"description=Annotation text (required unless format is graphite)"`
+	Data               map[string]any `json:"data,omitempty"         jsonschema:"description=Optional JSON payload"`
 
 	// Graphite-specific fields
 	Format       string `json:"format,omitempty"       jsonschema:"enum=graphite,description=Set to 'graphite' to create a Graphite-format annotation"`
@@ -100,7 +109,9 @@ func createAnnotation(ctx context.Context, args CreateAnnotationInput) (any, err
 			Tags: args.Tags,
 			Data: args.GraphiteData,
 		}
-		resp, err := c.Annotations.PostGraphiteAnnotation(req)
+		resp, err := c.Annotations.PostGraphiteAnnotationWithParams(
+			annotations.NewPostGraphiteAnnotationParamsWithContext(ctx).WithBody(req),
+		)
 		if err != nil {
 			return nil, fmt.Errorf("create graphite annotation: %w", err)
 		}
@@ -111,9 +122,12 @@ func createAnnotation(ctx context.Context, args CreateAnnotationInput) (any, err
 		return nil, fmt.Errorf("'text' is required for standard annotations")
 	}
 
+	dashboardUID := args.DashboardUID
+	if dashboardUID == "" {
+		dashboardUID = args.LegacyDashboardUID
+	}
 	req := models.PostAnnotationsCmd{
-		DashboardID:  args.DashboardID,
-		DashboardUID: args.DashboardUID,
+		DashboardUID: dashboardUID,
 		PanelID:      args.PanelID,
 		Time:         args.Time,
 		TimeEnd:      args.TimeEnd,
@@ -122,7 +136,9 @@ func createAnnotation(ctx context.Context, args CreateAnnotationInput) (any, err
 		Data:         args.Data,
 	}
 
-	resp, err := c.Annotations.PostAnnotation(&req)
+	resp, err := c.Annotations.PostAnnotationWithParams(
+		annotations.NewPostAnnotationParamsWithContext(ctx).WithBody(&req),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create annotation: %w", err)
 	}
@@ -171,7 +187,9 @@ func updateAnnotation(ctx context.Context, args UpdateAnnotationInput) (*annotat
 		body.Data = args.Data
 	}
 
-	resp, err := c.Annotations.PatchAnnotation(id, body)
+	resp, err := c.Annotations.PatchAnnotationWithParams(
+		annotations.NewPatchAnnotationParamsWithContext(ctx).WithAnnotationID(id).WithBody(body),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("update annotation: %w", err)
 	}

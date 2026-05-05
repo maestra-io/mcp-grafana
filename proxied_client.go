@@ -2,9 +2,8 @@ package mcpgrafana
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
-	"log/slog"
+	"net/http"
 	"sync"
 
 	mcp_client "github.com/mark3labs/mcp-go/client"
@@ -24,28 +23,18 @@ type ProxiedClient struct {
 
 // NewProxiedClient creates a new connection to a remote MCP server
 func NewProxiedClient(ctx context.Context, datasourceUID, datasourceName, datasourceType, mcpEndpoint string) (*ProxiedClient, error) {
-	// Get Grafana config for authentication
 	config := GrafanaConfigFromContext(ctx)
+	logger := config.LoggerOrDefault()
 
-	// Build headers for authentication
-	headers := make(map[string]string)
-	if config.APIKey != "" {
-		headers["Authorization"] = "Bearer " + config.APIKey
-	} else if config.BasicAuth != nil {
-		auth := config.BasicAuth.String()
-		headers["Authorization"] = "Basic " + base64.StdEncoding.EncodeToString([]byte(auth))
+	rt, err := BuildTransport(&config, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build transport: %w", err)
 	}
 
-	// Add org ID header if configured
-	if config.OrgID != 0 {
-		headers["X-Grafana-Org-Id"] = fmt.Sprintf("%d", config.OrgID)
-	}
-
-	// Create HTTP transport with authentication and org ID headers
-	slog.DebugContext(ctx, "connecting to MCP server", "datasource", datasourceUID, "url", mcpEndpoint)
+	logger.DebugContext(ctx, "connecting to MCP server", "datasource", datasourceUID, "url", mcpEndpoint)
 	httpTransport, err := transport.NewStreamableHTTP(
 		mcpEndpoint,
-		transport.WithHTTPHeaders(headers),
+		transport.WithHTTPBasicClient(&http.Client{Transport: rt}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP transport: %w", err)
@@ -76,7 +65,7 @@ func NewProxiedClient(ctx context.Context, datasourceUID, datasourceName, dataso
 		return nil, fmt.Errorf("failed to list tools from remote MCP server: %w", err)
 	}
 
-	slog.DebugContext(ctx, "connected to proxied MCP server",
+	logger.DebugContext(ctx, "connected to proxied MCP server",
 		"datasource", datasourceUID,
 		"type", datasourceType,
 		"tools", len(toolsResult.Tools))

@@ -4,15 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"reflect"
-	"strconv"
 	"strings"
 
 	aapi "github.com/grafana/amixr-api-go-client"
-	"github.com/grafana/grafana-openapi-client-go/client"
 	mcpgrafana "github.com/grafana/mcp-grafana"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -23,29 +20,23 @@ import (
 // the OnCall URL from the jsonData.onCallApiUrl field in the response.
 // Returns the OnCall URL if found, or an error if the URL cannot be retrieved.
 func getOnCallURLFromSettings(ctx context.Context, cfg mcpgrafana.GrafanaConfig) (string, error) {
-	settingsURL := fmt.Sprintf("%s/api/plugins/grafana-irm-app/settings", strings.TrimRight(cfg.URL, "/"))
+	settingsURL, err := url.JoinPath(cfg.URL, "/api/plugins/grafana-irm-app/settings")
+	if err != nil {
+		return "", fmt.Errorf("building settings URL: %w", err)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", settingsURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("creating settings request: %w", err)
 	}
 
-	if cfg.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-	} else if cfg.BasicAuth != nil {
-		password, _ := cfg.BasicAuth.Password()
-		req.SetBasicAuth(cfg.BasicAuth.Username(), password)
+	transport, err := mcpgrafana.BuildTransport(&cfg, nil)
+	if err != nil {
+		return "", fmt.Errorf("building transport: %w", err)
 	}
 
-	// Add org ID header for multi-org support
-	if cfg.OrgID > 0 {
-		req.Header.Set(client.OrgIDHeader, strconv.FormatInt(cfg.OrgID, 10))
-	}
-
-	// Add user agent for tracking
-	req.Header.Set("User-Agent", mcpgrafana.UserAgent())
-
-	resp, err := http.DefaultClient.Do(req)
+	httpClient := &http.Client{Transport: transport}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("fetching settings: %w", err)
 	}
@@ -94,7 +85,7 @@ func oncallClientFromContext(ctx context.Context) (*aapi.Client, error) {
 	if token == "" {
 		token = cfg.APIKey
 		if token != "" {
-			slog.Debug("Using service account token for OnCall API",
+			cfg.LoggerOrDefault().Debug("Using service account token for OnCall API",
 				"hint", "set GRAFANA_ONCALL_TOKEN for mutating actions (acknowledge, resolve, silence)")
 		}
 	}
@@ -106,15 +97,15 @@ func oncallClientFromContext(ctx context.Context) (*aapi.Client, error) {
 		return nil, fmt.Errorf("creating OnCall client: %w", err)
 	}
 
-	// Try to customize the HTTP client with user agent using reflection
-	// since the OnCall client doesn't expose its HTTP client directly
+	// Customize the HTTP client's transport using reflection since the
+	// OnCall client doesn't expose its HTTP client directly. Auth is
+	// handled by the OnCall library (API key passed above), so we skip it.
 	clientValue := reflect.ValueOf(client)
 	if clientValue.Kind() == reflect.Ptr && !clientValue.IsNil() {
 		clientValue = clientValue.Elem()
 		if clientValue.Kind() == reflect.Struct {
 			httpClientField := clientValue.FieldByName("HTTPClient")
 			if !httpClientField.IsValid() {
-				// Try alternative field names
 				httpClientField = clientValue.FieldByName("HttpClient")
 			}
 			if !httpClientField.IsValid() {
@@ -122,15 +113,11 @@ func oncallClientFromContext(ctx context.Context) (*aapi.Client, error) {
 			}
 			if httpClientField.IsValid() && httpClientField.CanSet() {
 				if httpClient, ok := httpClientField.Interface().(*http.Client); ok {
-					// Wrap the transport with user agent
-					if httpClient.Transport == nil {
-						httpClient.Transport = http.DefaultTransport
+					transport, err := mcpgrafana.BuildTransport(&cfg, nil, mcpgrafana.WithoutAuth())
+					if err != nil {
+						return nil, fmt.Errorf("building transport for OnCall client: %w", err)
 					}
-					transport := httpClient.Transport
-					if len(cfg.ExtraHeaders) > 0 {
-						transport = mcpgrafana.NewExtraHeadersRoundTripper(transport, cfg.ExtraHeaders)
-					}
-					httpClient.Transport = mcpgrafana.NewUserAgentTransport(transport)
+					httpClient.Transport = transport
 				}
 			}
 		}
@@ -325,11 +312,12 @@ func getCurrentOnCallUsers(ctx context.Context, args GetCurrentOnCallUsersParams
 	}
 
 	// Fetch details for each user currently on call
+	logger := mcpgrafana.GrafanaConfigFromContext(ctx).LoggerOrDefault()
 	for _, userID := range schedule.OnCallNow {
 		user, _, err := userService.GetUser(userID, &aapi.GetUserOptions{})
 		if err != nil {
 			// Log the error but continue with other users
-			slog.Warn("Failed to fetch OnCall user", "user_id", userID, "error", err)
+			logger.Warn("Failed to fetch OnCall user", "user_id", userID, "error", err)
 			continue
 		}
 		result.Users = append(result.Users, user)

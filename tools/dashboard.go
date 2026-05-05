@@ -15,6 +15,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/grafana/grafana-openapi-client-go/client/dashboards"
 	"github.com/grafana/grafana-openapi-client-go/models"
 	mcpgrafana "github.com/grafana/mcp-grafana"
 )
@@ -25,7 +26,9 @@ type GetDashboardByUIDParams struct {
 
 func getDashboardByUID(ctx context.Context, args GetDashboardByUIDParams) (*models.DashboardFullWithMeta, error) {
 	c := mcpgrafana.GrafanaClientFromContext(ctx)
-	dashboard, err := c.Dashboards.GetDashboardByUID(args.UID)
+	dashboard, err := c.Dashboards.GetDashboardByUIDWithParams(
+		dashboards.NewGetDashboardByUIDParamsWithContext(ctx).WithUID(args.UID),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("get dashboard by uid %s: %w", args.UID, err)
 	}
@@ -150,7 +153,9 @@ func updateDashboardWithFullJSON(ctx context.Context, args UpdateDashboardParams
 		Overwrite: args.Overwrite,
 		UserID:    args.UserID,
 	}
-	dashboard, err := c.Dashboards.PostDashboard(cmd)
+	dashboard, err := c.Dashboards.PostDashboardWithParams(
+		dashboards.NewPostDashboardParamsWithContext(ctx).WithBody(cmd),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to save dashboard: %w", err)
 	}
@@ -448,14 +453,13 @@ func getDashboardSummary(ctx context.Context, args GetDashboardSummaryParams) (*
 	// Extract time range
 	summary.TimeRange = extractTimeRange(db)
 
-	// Extract panel summaries
-	if panels := safeArray(db, "panels"); panels != nil {
-		summary.PanelCount = len(panels)
-		for _, p := range panels {
-			if panelObj, ok := p.(map[string]interface{}); ok {
-				summary.Panels = append(summary.Panels, extractPanelSummary(panelObj))
-			}
-		}
+	// Reuse the shared panel walker so summaries match findPanelByID /
+	// run_panel_query and include row-nested panels in modern dashboards
+	// (without it, dashboards using row nesting reported partial summaries).
+	allPanels := collectAllPanels(db)
+	summary.PanelCount = len(allPanels)
+	for _, panelObj := range allPanels {
+		summary.Panels = append(summary.Panels, extractPanelSummary(panelObj))
 	}
 
 	// Extract variable summaries

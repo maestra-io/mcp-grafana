@@ -134,7 +134,7 @@ type RenderTimeRange struct {
 
 func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallToolResult, error) {
 	config := mcpgrafana.GrafanaConfigFromContext(ctx)
-	baseURL := strings.TrimRight(config.URL, "/")
+	baseURL := config.URL
 
 	if baseURL == "" {
 		return nil, fmt.Errorf("grafana URL not configured. Please set GRAFANA_URL environment variable or X-Grafana-URL header")
@@ -171,22 +171,6 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-
-	// Add authentication headers
-	if config.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+config.APIKey)
-	} else if config.BasicAuth != nil {
-		password, _ := config.BasicAuth.Password()
-		req.SetBasicAuth(config.BasicAuth.Username(), password)
-	}
-
-	// Add org ID header if specified
-	if config.OrgID > 0 {
-		req.Header.Set("X-Grafana-Org-Id", strconv.FormatInt(config.OrgID, 10))
-	}
-
-	// Add user agent
-	req.Header.Set("User-Agent", mcpgrafana.UserAgent())
 
 	// Prefer raw image bytes so API gateways (e.g. Kong) that inspect
 	// Accept to decide response format return the PNG directly.
@@ -420,11 +404,17 @@ func buildRenderURL(baseURL string, args GetPanelImageParams) (string, error) {
 	// Strip trailing slashes from base URL for consistent URL construction
 	baseURL = strings.TrimRight(baseURL, "/")
 
-	// Build the render path
-	renderPath := fmt.Sprintf("/render/d/%s", args.DashboardUID)
-
 	// Build query parameters
 	params := url.Values{}
+
+	// Single-panel renders use the purpose-built /d-solo route (lighter than loading
+	// the full dashboard with viewPanel). Full dashboard renders use /d as default.
+	renderPath := fmt.Sprintf("/render/d/%s", args.DashboardUID)
+
+	if args.PanelID != nil {
+		renderPath = fmt.Sprintf("/render/d-solo/%s", args.DashboardUID)
+		params.Set("panelId", strconv.Itoa(*args.PanelID))
+	}
 
 	// Set dimensions
 	width := 1000
@@ -444,11 +434,6 @@ func buildRenderURL(baseURL string, args GetPanelImageParams) (string, error) {
 		scale = *args.Scale
 	}
 	params.Set("scale", strconv.Itoa(scale))
-
-	// Add panel ID if specified (for single panel rendering)
-	if args.PanelID != nil {
-		params.Set("viewPanel", strconv.Itoa(*args.PanelID))
-	}
 
 	// Add time range
 	if args.TimeRange != nil {
@@ -483,8 +468,6 @@ func createHTTPClient(config mcpgrafana.GrafanaConfig) (*http.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	transport = mcpgrafana.NewOrgIDRoundTripper(transport, config.OrgID)
-	transport = mcpgrafana.NewUserAgentTransport(transport)
 
 	return &http.Client{Transport: transport}, nil
 }
