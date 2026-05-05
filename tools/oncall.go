@@ -20,7 +20,10 @@ import (
 // the OnCall URL from the jsonData.onCallApiUrl field in the response.
 // Returns the OnCall URL if found, or an error if the URL cannot be retrieved.
 func getOnCallURLFromSettings(ctx context.Context, cfg mcpgrafana.GrafanaConfig) (string, error) {
-	settingsURL := fmt.Sprintf("%s/api/plugins/grafana-irm-app/settings", cfg.URL)
+	settingsURL, err := url.JoinPath(cfg.URL, "/api/plugins/grafana-irm-app/settings")
+	if err != nil {
+		return "", fmt.Errorf("building settings URL: %w", err)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", settingsURL, nil)
 	if err != nil {
@@ -112,10 +115,9 @@ func oncallClientFromContext(ctx context.Context) (*aapi.Client, error) {
 				if httpClient, ok := httpClientField.Interface().(*http.Client); ok {
 					transport, err := mcpgrafana.BuildTransport(&cfg, nil, mcpgrafana.WithoutAuth())
 					if err != nil {
-						mcpgrafana.LoggerFromContext(ctx).Error("Failed to build transport for OnCall client", "error", err)
-					} else {
-						httpClient.Transport = transport
+						return nil, fmt.Errorf("building transport for OnCall client: %w", err)
 					}
+					httpClient.Transport = transport
 				}
 			}
 		}

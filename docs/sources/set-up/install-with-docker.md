@@ -28,11 +28,14 @@ You run the server in a container and connect your MCP client. You can use stdio
 For direct integration with AI assistants, most users will want to use STDIO mode. Pass `-t stdio` and `-i` so the container keeps stdin open.
 
 ### Local Grafana:
+
+Inside the container `localhost` resolves to the container itself, not the host machine. Use `host.docker.internal` (built-in on Docker Desktop; on Linux, add `--add-host=host.docker.internal:host-gateway`) — or `--network=host` — to reach a Grafana running on the host.
+
 ```bash
 docker pull grafana/mcp-grafana
 docker run --rm -i \
-  -e GRAFANA_URL=http://localhost:3000 \
-  -e GRAFANA_SERVICE_ACCOUNT_TOKEN=<your service account token> \
+  -e GRAFANA_URL=http://host.docker.internal:3000 \
+  -e GRAFANA_SERVICE_ACCOUNT_TOKEN=YOUR_SERVICE_ACCOUNT_TOKEN \
   grafana/mcp-grafana -t stdio
 ```
 
@@ -41,7 +44,7 @@ docker run --rm -i \
 docker pull grafana/mcp-grafana
 docker run --rm -i \
   -e GRAFANA_URL=https://myinstance.grafana.net \
-  -e GRAFANA_SERVICE_ACCOUNT_TOKEN=<your service account token> \
+  -e GRAFANA_SERVICE_ACCOUNT_TOKEN=YOUR_SERVICE_ACCOUNT_TOKEN \
   grafana/mcp-grafana -t stdio
 ```
 
@@ -52,8 +55,8 @@ In this mode, the server runs as an HTTP server that clients connect to. You mus
 ```bash
 docker pull grafana/mcp-grafana
 docker run --rm -p 8000:8000 \
-  -e GRAFANA_URL=http://localhost:3000 \
-  -e GRAFANA_SERVICE_ACCOUNT_TOKEN=<your service account token> \
+  -e GRAFANA_URL=http://host.docker.internal:3000 \
+  -e GRAFANA_SERVICE_ACCOUNT_TOKEN=YOUR_SERVICE_ACCOUNT_TOKEN \
   grafana/mcp-grafana
 ```
 
@@ -66,8 +69,8 @@ In this mode, the server operates as an independent process that can handle mult
 ```bash
 docker pull grafana/mcp-grafana
 docker run --rm -p 8000:8000 \
-  -e GRAFANA_URL=http://localhost:3000 \
-  -e GRAFANA_SERVICE_ACCOUNT_TOKEN=<your service account token> \
+  -e GRAFANA_URL=http://host.docker.internal:3000 \
+  -e GRAFANA_SERVICE_ACCOUNT_TOKEN=YOUR_SERVICE_ACCOUNT_TOKEN \
   grafana/mcp-grafana -t streamable-http
 ```
 
@@ -81,8 +84,8 @@ To terminate TLS on the MCP server, mount certificates and set `--server.tls-cer
 docker pull grafana/mcp-grafana
 docker run --rm -p 8443:8443 \
   -v /path/to/certs:/certs:ro \
-  -e GRAFANA_URL=http://localhost:3000 \
-  -e GRAFANA_SERVICE_ACCOUNT_TOKEN=<your service account token> \
+  -e GRAFANA_URL=http://host.docker.internal:3000 \
+  -e GRAFANA_SERVICE_ACCOUNT_TOKEN=YOUR_SERVICE_ACCOUNT_TOKEN \
   grafana/mcp-grafana \
   -t streamable-http \
   --address :8443 \

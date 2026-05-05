@@ -453,29 +453,13 @@ func getDashboardSummary(ctx context.Context, args GetDashboardSummaryParams) (*
 	// Extract time range
 	summary.TimeRange = extractTimeRange(db)
 
-	// Extract panel summaries. Modern dashboards put panels at the top
-	// level; legacy schemaVersion <= 14 dashboards put them under
-	// "rows":[{panels:[...]}] with no top-level "panels".
-	if panels := safeArray(db, "panels"); panels != nil {
-		summary.PanelCount = len(panels)
-		for _, p := range panels {
-			if panelObj, ok := p.(map[string]interface{}); ok {
-				summary.Panels = append(summary.Panels, extractPanelSummary(panelObj))
-			}
-		}
-	} else if rows := safeArray(db, "rows"); rows != nil {
-		for _, r := range rows {
-			row, ok := r.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			for _, p := range safeArray(row, "panels") {
-				if panelObj, ok := p.(map[string]interface{}); ok {
-					summary.Panels = append(summary.Panels, extractPanelSummary(panelObj))
-				}
-			}
-		}
-		summary.PanelCount = len(summary.Panels)
+	// Reuse the shared panel walker so summaries match findPanelByID /
+	// run_panel_query and include row-nested panels in modern dashboards
+	// (without it, dashboards using row nesting reported partial summaries).
+	allPanels := collectAllPanels(db)
+	summary.PanelCount = len(allPanels)
+	for _, panelObj := range allPanels {
+		summary.Panels = append(summary.Panels, extractPanelSummary(panelObj))
 	}
 
 	// Extract variable summaries

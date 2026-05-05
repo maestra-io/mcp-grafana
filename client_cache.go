@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
-	"strings"
 	"sync"
 
 	"github.com/grafana/incident-go"
@@ -42,31 +41,40 @@ func cacheKeyFromRequest(grafanaURL, apiKey string, basicAuth *url.Userinfo, org
 		key.password, _ = basicAuth.Password()
 	}
 	if req != nil {
-		headers := forwardedHeadersFromRequest(req)
-		if len(headers) > 0 {
-			names := make([]string, 0, len(headers))
-			for k := range headers {
-				names = append(names, k)
-			}
-			sort.Strings(names)
-			var sb strings.Builder
-			for _, k := range names {
-				sb.WriteString(k)
-				sb.WriteByte('=')
-				sb.WriteString(headers[k])
-				sb.WriteByte(',')
-			}
-			key.forwardedHeaders = sb.String()
-		}
+		key.forwardedHeaders = forwardedHeadersDigest(forwardedHeadersFromRequest(req))
 	}
 	return key
 }
 
+// forwardedHeadersDigest returns a length-prefixed SHA-256 of the sorted
+// header pairs so that the resulting string (a) cannot collide between
+// different header sets containing `=` or `,` in their values, and (b) is
+// safe to surface in debug logs (no raw header values leak).
+func forwardedHeadersDigest(headers map[string]string) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(headers))
+	for k := range headers {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	h := sha256.New()
+	for _, k := range names {
+		v := headers[k]
+		_, _ = fmt.Fprintf(h, "%d:%s%d:%s", len(k), k, len(v), v)
+	}
+	return fmt.Sprintf("sha256:%x", h.Sum(nil))
+}
+
 // String returns a redacted string representation for logging.
+// forwardedHeaders is already a digest; we expose only the count of forwarded
+// headers and the digest itself to avoid leaking sensitive request data.
 func (k clientCacheKey) String() string {
 	hasKey := k.apiKey != ""
 	hasBasic := k.username != ""
-	return fmt.Sprintf("url=%s apiKey=%t basicAuth=%t orgID=%d forwardedHeaders=%s", k.url, hasKey, hasBasic, k.orgID, k.forwardedHeaders)
+	hasFwd := k.forwardedHeaders != ""
+	return fmt.Sprintf("url=%s apiKey=%t basicAuth=%t orgID=%d forwardedHeaders=%t", k.url, hasKey, hasBasic, k.orgID, hasFwd)
 }
 
 // clientCacheMetrics holds OTel instruments for cache observability.

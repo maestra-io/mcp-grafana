@@ -11,7 +11,13 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 )
 
-var promqlParser = parser.NewParser(parser.Options{})
+// newPromqlParser returns a fresh PromQL parser. The Prometheus parser is not
+// safe for concurrent use across goroutines (it relies on pooled internal
+// state and global configuration), so handler-side selector parsing creates
+// one per call rather than sharing a package-level instance.
+func newPromqlParser() parser.Parser {
+	return parser.NewParser(parser.Options{})
+}
 
 var validAlertStates = map[string]bool{
 	"firing": true, "pending": true, "normal": true,
@@ -495,6 +501,7 @@ func parseMatcherStrings(strs []string) ([]*labels.Matcher, error) {
 	if len(strs) == 0 {
 		return nil, nil
 	}
+	p := newPromqlParser()
 	var result []*labels.Matcher
 	for _, s := range strs {
 		s = strings.TrimSpace(s)
@@ -502,7 +509,7 @@ func parseMatcherStrings(strs []string) ([]*labels.Matcher, error) {
 			s = "{" + s + "}"
 		}
 		s = quoteUnquotedLabelValues(s)
-		parsed, err := promqlParser.ParseMetricSelector(s)
+		parsed, err := p.ParseMetricSelector(s)
 		if err != nil {
 			return nil, fmt.Errorf("invalid matcher %q: %w", s, err)
 		}
@@ -517,6 +524,7 @@ func parseSelectorStrings(strs []string) ([]Selector, error) {
 	if len(strs) == 0 {
 		return nil, nil
 	}
+	p := newPromqlParser()
 	var result []Selector
 	for _, s := range strs {
 		s = strings.TrimSpace(s)
@@ -524,7 +532,7 @@ func parseSelectorStrings(strs []string) ([]Selector, error) {
 			s = "{" + s + "}"
 		}
 		s = quoteUnquotedLabelValues(s)
-		parsed, err := promqlParser.ParseMetricSelector(s)
+		parsed, err := p.ParseMetricSelector(s)
 		if err != nil {
 			return nil, fmt.Errorf("invalid label selector %q: %w", s, err)
 		}

@@ -355,7 +355,7 @@ PODMAN="$(if command -v podman >/dev/null 2>&1; then echo podman; else echo dock
 if ! command -v curl >/dev/null 2>&1; then
   if ! command -v wget >/dev/null 2>&1; then
     # shellcheck disable=SC2016
-    errr 'either `curl` or `wget` must be installed for this script to work.'
+    printf 'ERRR: %s\r\n' 'either `curl` or `wget` must be installed for this script to work.' >&2
 
     exit 1
   fi
@@ -363,7 +363,7 @@ fi
 
 if ! command -v "${PODMAN}" >/dev/null 2>&1; then
   # shellcheck disable=SC2016
-  errr 'either `podman` or `docker` must be installed for this script to work.'
+  printf 'ERRR: %s\r\n' 'either `podman` or `docker` must be installed for this script to work.' >&2
 
   exit 1
 fi

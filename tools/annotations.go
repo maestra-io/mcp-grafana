@@ -65,8 +65,12 @@ var GetAnnotationsTool = mcpgrafana.MustTool(
 
 // CreateAnnotationInput creates a new annotation, optionally in Graphite format.
 type CreateAnnotationInput struct {
-	DashboardUID string         `json:"dashboardUid,omitempty" jsonschema:"description=Dashboard UID"`
-	PanelID      int64          `json:"panelId,omitempty"      jsonschema:"description=Panel ID"`
+	DashboardUID string `json:"dashboardUid,omitempty" jsonschema:"description=Dashboard UID"`
+	// LegacyDashboardUID accepts the pre-rename JSON key dashboardUID for
+	// backward compatibility with existing clients. Only DashboardUID is
+	// surfaced in the tool's JSON schema.
+	LegacyDashboardUID string         `json:"dashboardUID,omitempty" jsonschema:"-"`
+	PanelID            int64          `json:"panelId,omitempty"      jsonschema:"description=Panel ID"`
 	Time         int64          `json:"time,omitempty"         jsonschema:"description=Start time epoch ms"`
 	TimeEnd      int64          `json:"timeEnd,omitempty"      jsonschema:"description=End time epoch ms"`
 	Tags         []string       `json:"tags,omitempty"         jsonschema:"description=Optional list of tags"`
@@ -108,8 +112,12 @@ func createAnnotation(ctx context.Context, args CreateAnnotationInput) (any, err
 		return nil, fmt.Errorf("'text' is required for standard annotations")
 	}
 
+	dashboardUID := args.DashboardUID
+	if dashboardUID == "" {
+		dashboardUID = args.LegacyDashboardUID
+	}
 	req := models.PostAnnotationsCmd{
-		DashboardUID: args.DashboardUID,
+		DashboardUID: dashboardUID,
 		PanelID:      args.PanelID,
 		Time:         args.Time,
 		TimeEnd:      args.TimeEnd,

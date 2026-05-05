@@ -63,6 +63,24 @@ async def test_elasticsearch_query_errors(
     )
 
 
+def _assert_opensearch_datasource_used(tools_called) -> None:
+    """Assert query_elasticsearch was actually routed to the OpenSearch datasource.
+
+    Without this check the OpenSearch tests would pass even if the LLM picked
+    the Elasticsearch datasource, since both datasources contain the same
+    seeded log data.
+    """
+    used_uids = [
+        tc.args.get("datasourceUid")
+        for tc in tools_called
+        if tc.name == "query_elasticsearch"
+    ]
+    assert "opensearch" in used_uids, (
+        f"Expected query_elasticsearch with datasourceUid='opensearch', "
+        f"got datasourceUids={used_uids}"
+    )
+
+
 @pytest.mark.parametrize("model", models)
 @pytest.mark.flaky(reruns=2)
 async def test_opensearch_query_logs(
@@ -78,6 +96,7 @@ async def test_opensearch_query_logs(
         model, mcp_client, mcp_transport, prompt
     )
 
+    _assert_opensearch_datasource_used(tools_called)
     assert_mcp_eval(
         prompt,
         final_content,
@@ -106,6 +125,7 @@ async def test_opensearch_query_errors(
         model, mcp_client, mcp_transport, prompt
     )
 
+    _assert_opensearch_datasource_used(tools_called)
     assert_mcp_eval(
         prompt,
         final_content,

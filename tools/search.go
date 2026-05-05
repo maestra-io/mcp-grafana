@@ -120,6 +120,8 @@ func searchFolders(ctx context.Context, args SearchFoldersParams) (*SearchDashbo
 		params.SetQuery(&args.Query)
 	}
 	params.SetType(&folderTypeStr)
+	limit := int64(folderSearchLimit)
+	params.SetLimit(&limit)
 	searchResp, err := c.Search.Search(params)
 	if err != nil {
 		return nil, fmt.Errorf("search folders for %+v: %w", c, err)
@@ -127,8 +129,13 @@ func searchFolders(ctx context.Context, args SearchFoldersParams) (*SearchDashbo
 	return &SearchDashboardsResult{
 		Dashboards: summarizeHitList(searchResp.Payload),
 		Total:      len(searchResp.Payload),
+		HasMore:    len(searchResp.Payload) >= folderSearchLimit,
 	}, nil
 }
+
+// folderSearchLimit caps a single search_folders response and lets callers
+// detect truncation via HasMore. Matches the search_dashboards default.
+const folderSearchLimit = 100
 
 var SearchFolders = mcpgrafana.MustTool(
 	"search_folders",

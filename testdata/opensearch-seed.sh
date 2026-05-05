@@ -7,7 +7,14 @@ set -e
 OS_URL="${OS_URL:-http://opensearch:9200}"
 
 echo "Waiting for OpenSearch to be ready..."
+max_retries="${MAX_RETRIES:-90}" # ~3 minutes at 2s interval
+retries=0
 until curl -sf "${OS_URL}/_cluster/health" > /dev/null 2>&1; do
+  retries=$((retries + 1))
+  if [ "$retries" -ge "$max_retries" ]; then
+    echo "OpenSearch did not become ready after $((max_retries * 2))s" >&2
+    exit 1
+  fi
   sleep 2
 done
 echo "OpenSearch is ready."
@@ -53,8 +60,10 @@ O8=$((NOW_MS - 480000))
 O9=$((NOW_MS - 540000))
 O10=$((NOW_MS - 600000))
 
-# Bulk index sample log documents
-curl -sf -X POST "${OS_URL}/test-logs-2024/_bulk" \
+# Bulk index sample log documents. `_bulk` can return HTTP 200 with item-level
+# errors (`"errors": true`); curl -f only checks HTTP status, so we capture the
+# response body and fail explicitly if any item failed to index.
+bulk_resp=$(curl -sS -X POST "${OS_URL}/test-logs-2024/_bulk" \
   -H 'Content-Type: application/x-ndjson' \
   -d '{"index":{}}
 {"@timestamp":'"${O1}"',"message":"GET /api/users 200 OK","level":"info","service":"api-gateway","host":"server1","status_code":200,"duration_ms":12.5,"trace_id":"abc123"}
@@ -76,7 +85,11 @@ curl -sf -X POST "${OS_URL}/test-logs-2024/_bulk" \
 {"@timestamp":'"${O9}"',"message":"Rate limit exceeded for IP 192.168.1.100","level":"warn","service":"api-gateway","host":"server1","status_code":429,"duration_ms":0.8,"trace_id":"yza567"}
 {"index":{}}
 {"@timestamp":'"${O10}"',"message":"Scheduled job completed: cleanup_sessions","level":"info","service":"scheduler","host":"server2","status_code":200,"duration_ms":1523.4,"trace_id":"bcd890"}
-'
+')
+if ! echo "$bulk_resp" | grep -q '"errors":false'; then
+  echo "Bulk indexing reported errors: $bulk_resp" >&2
+  exit 1
+fi
 echo ""
 echo "Indexed sample log data."
 
