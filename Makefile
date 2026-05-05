@@ -16,12 +16,15 @@ build-image: ## Build the Docker image.
 build: ## Build the binary.
 	go build -o dist/mcp-grafana ./cmd/mcp-grafana
 
-.PHONY: lint lint-jsonschema lint-jsonschema-fix
-lint: lint-jsonschema ## Lint the Go code.
+.PHONY: lint lint-jsonschema lint-jsonschema-fix lint-openapi
+lint: lint-jsonschema lint-openapi ## Lint the Go code.
 	golangci-lint run
 
 lint-jsonschema: ## Lint for unescaped commas in jsonschema tags.
 	go run ./cmd/linters/jsonschema --path .
+
+lint-openapi: ## Lint for openapi client calls missing context propagation.
+	go run ./cmd/linters/openapi ./tools/... ./
 
 lint-jsonschema-fix: ## Automatically fix unescaped commas in jsonschema tags.
 	go run ./cmd/linters/jsonschema --path . --fix
@@ -54,7 +57,9 @@ test-python-e2e: ## Run Python E2E tests (requires docker-compose services and S
 # Common environment variables for run targets
 GRAFANA_ENV = GRAFANA_USERNAME=admin GRAFANA_PASSWORD=admin
 OTEL_ENV = OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 OTEL_EXPORTER_OTLP_INSECURE=true
-ENABLED_TOOLS = search,datasource,incident,prometheus,loki,elasticsearch,alerting,dashboard,folder,oncall,asserts,sift,pyroscope,navigation,proxied,annotations,rendering,admin,clickhouse,cloudwatch
+ENABLED_TOOLS = search,datasource,incident,prometheus,loki,elasticsearch,influxdb,alerting,dashboard,folder,oncall,asserts,sift,pyroscope,navigation,proxied,annotations,rendering,admin,clickhouse,cloudwatch
+# Note: influxdb is opt-in for end users (like clickhouse/cloudwatch/elasticsearch)
+# but included in Makefile run targets so local development exercises the code.
 
 .PHONY: run
 run: ## Run the MCP server in stdio mode.
