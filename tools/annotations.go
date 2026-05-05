@@ -71,11 +71,11 @@ type CreateAnnotationInput struct {
 	// surfaced in the tool's JSON schema.
 	LegacyDashboardUID string         `json:"dashboardUID,omitempty" jsonschema:"-"`
 	PanelID            int64          `json:"panelId,omitempty"      jsonschema:"description=Panel ID"`
-	Time         int64          `json:"time,omitempty"         jsonschema:"description=Start time epoch ms"`
-	TimeEnd      int64          `json:"timeEnd,omitempty"      jsonschema:"description=End time epoch ms"`
-	Tags         []string       `json:"tags,omitempty"         jsonschema:"description=Optional list of tags"`
-	Text         string         `json:"text,omitempty"         jsonschema:"description=Annotation text (required unless format is graphite)"`
-	Data         map[string]any `json:"data,omitempty"         jsonschema:"description=Optional JSON payload"`
+	Time               int64          `json:"time,omitempty"         jsonschema:"description=Start time epoch ms"`
+	TimeEnd            int64          `json:"timeEnd,omitempty"      jsonschema:"description=End time epoch ms"`
+	Tags               []string       `json:"tags,omitempty"         jsonschema:"description=Optional list of tags"`
+	Text               string         `json:"text,omitempty"         jsonschema:"description=Annotation text (required unless format is graphite)"`
+	Data               map[string]any `json:"data,omitempty"         jsonschema:"description=Optional JSON payload"`
 
 	// Graphite-specific fields
 	Format       string `json:"format,omitempty"       jsonschema:"enum=graphite,description=Set to 'graphite' to create a Graphite-format annotation"`
