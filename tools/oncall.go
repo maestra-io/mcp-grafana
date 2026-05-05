@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -83,7 +82,7 @@ func oncallClientFromContext(ctx context.Context) (*aapi.Client, error) {
 	if token == "" {
 		token = cfg.APIKey
 		if token != "" {
-			slog.Debug("Using service account token for OnCall API",
+			cfg.LoggerOrDefault().Debug("Using service account token for OnCall API",
 				"hint", "set GRAFANA_ONCALL_TOKEN for mutating actions (acknowledge, resolve, silence)")
 		}
 	}
@@ -311,11 +310,12 @@ func getCurrentOnCallUsers(ctx context.Context, args GetCurrentOnCallUsersParams
 	}
 
 	// Fetch details for each user currently on call
+	logger := mcpgrafana.GrafanaConfigFromContext(ctx).LoggerOrDefault()
 	for _, userID := range schedule.OnCallNow {
 		user, _, err := userService.GetUser(userID, &aapi.GetUserOptions{})
 		if err != nil {
 			// Log the error but continue with other users
-			slog.Warn("Failed to fetch OnCall user", "user_id", userID, "error", err)
+			logger.Warn("Failed to fetch OnCall user", "user_id", userID, "error", err)
 			continue
 		}
 		result.Users = append(result.Users, user)
