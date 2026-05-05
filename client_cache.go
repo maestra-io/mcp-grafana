@@ -200,14 +200,17 @@ func (c *ClientCache) GetOrCreateGrafanaClient(key clientCacheKey, createFn func
 		// Create the client without holding any lock
 		client := createFn()
 
-		// Store the result
+		// Store the result. Capture the post-insert size while still holding
+		// the lock, then unlock before logging so synchronous log writes
+		// don't queue cache traffic behind us.
 		c.mu.Lock()
 		c.grafanaClients[key] = client
 		c.metrics.misses.Add(ctx, 1, typeAttr)
-		c.metrics.size.Record(ctx, int64(len(c.grafanaClients)), typeAttr)
-		c.logger.Debug("Cached new Grafana client", "key", key, "cache_size", len(c.grafanaClients))
+		size := len(c.grafanaClients)
+		c.metrics.size.Record(ctx, int64(size), typeAttr)
 		c.mu.Unlock()
 
+		c.logger.Debug("Cached new Grafana client", "key", key, "cache_size", size)
 		return client, nil
 	})
 
@@ -247,10 +250,11 @@ func (c *ClientCache) GetOrCreateIncidentClient(key clientCacheKey, createFn fun
 		c.mu.Lock()
 		c.incidentClients[key] = client
 		c.metrics.misses.Add(ctx, 1, typeAttr)
-		c.metrics.size.Record(ctx, int64(len(c.incidentClients)), typeAttr)
-		c.logger.Debug("Cached new incident client", "key", key, "cache_size", len(c.incidentClients))
+		size := len(c.incidentClients)
+		c.metrics.size.Record(ctx, int64(size), typeAttr)
 		c.mu.Unlock()
 
+		c.logger.Debug("Cached new incident client", "key", key, "cache_size", size)
 		return client, nil
 	})
 
@@ -325,8 +329,8 @@ func extractIncidentClientCached(cache *ClientCache) httpContextFunc {
 		config := GrafanaConfigFromContext(ctx)
 		logger := config.LoggerOrDefault()
 
-		grafanaURL, apiKey, _, orgID := extractKeyGrafanaInfoFromReq(req, logger)
-		key := cacheKeyFromRequest(grafanaURL, apiKey, nil, orgID, req)
+		grafanaURL, apiKey, basicAuth, orgID := extractKeyGrafanaInfoFromReq(req, logger)
+		key := cacheKeyFromRequest(grafanaURL, apiKey, basicAuth, orgID, req)
 
 		incidentClient := cache.GetOrCreateIncidentClient(key, func() *incident.Client {
 			incidentURL := fmt.Sprintf("%s/api/plugins/grafana-irm-app/resources/api/v1/", grafanaURL)
@@ -334,7 +338,11 @@ func extractIncidentClientCached(cache *ClientCache) httpContextFunc {
 			client := incident.NewClient(incidentURL, apiKey)
 
 			config.OrgID = orgID
-			transport, err := BuildTransport(&config, nil, WithoutAuth())
+			config.BasicAuth = basicAuth
+			// Don't disable auth: BuildTransport's auth round-tripper is the
+			// only path that injects basicAuth, and api-key callers also need
+			// the org-id / extra-headers / forwarded-headers layers.
+			transport, err := BuildTransport(&config, nil)
 			if err != nil {
 				logger.Error("Failed to create custom transport for incident client, using default", "error", err)
 			} else {

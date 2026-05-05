@@ -36,8 +36,10 @@ type GetAnnotationsInput struct {
 func getAnnotations(ctx context.Context, args GetAnnotationsInput) (*annotations.GetAnnotationsOK, error) {
 	c := mcpgrafana.GrafanaClientFromContext(ctx)
 
+	// Coalesce: nil OR empty-string both fall back to the legacy key,
+	// matching createAnnotation's empty-string handling.
 	dashboardUID := args.DashboardUID
-	if dashboardUID == nil {
+	if (dashboardUID == nil || *dashboardUID == "") && args.LegacyDashboardUID != nil {
 		dashboardUID = args.LegacyDashboardUID
 	}
 	req := annotations.GetAnnotationsParams{
