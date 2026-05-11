@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `oncall.get_alert_group` no longer silently drops `acknowledged_by`, `resolved_by`, `silenced_at`, and `last_alert` fields. The upstream amixr-api-go-client `AlertGroup` struct only declares the 10 list-shape fields, so unmarshaling the detail-endpoint response through that struct truncated the response. The wrapper now decodes into a local `DetailedAlertGroup` struct and calls the API directly, mirroring the pattern already used by `alertGroupAction`.
+
 ## [0.13.1] - 2026-04-30
 
 ### Added

@@ -141,3 +141,79 @@ func TestOncallClientFromContext_WhitespaceOnCallToken(t *testing.T) {
 	_, err := oncallClientFromContext(ctx)
 	require.NoError(t, err)
 }
+
+// TestGetAlertGroup_SurfacesDetailFields proves the wrapper preserves fields
+// that the upstream amixr-api-go-client AlertGroup struct drops:
+// acknowledged_by, resolved_by, silenced_at, last_alert.
+func TestGetAlertGroup_SurfacesDetailFields(t *testing.T) {
+	detailJSON := `{
+		"id": "I12345",
+		"integration_id": "C1",
+		"route_id": "R1",
+		"alerts_count": 3,
+		"state": "firing",
+		"created_at": "2026-05-01T00:00:00Z",
+		"resolved_at": "",
+		"acknowledged_at": "2026-05-01T01:00:00Z",
+		"title": "TestAlert",
+		"permalinks": {"slack": "https://example/slack"},
+		"acknowledged_by": "user-1",
+		"resolved_by": "",
+		"silenced_at": "",
+		"last_alert": {
+			"id": "A1",
+			"created_at": "2026-05-01T02:00:00Z",
+			"payload": {"ruleName": "TestRule", "message": "hello", "labels": {"severity": "high"}}
+		}
+	}`
+
+	oncallServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v1/alert_groups/I12345/" {
+			_, _ = w.Write([]byte(detailJSON))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(oncallServer.Close)
+
+	grafanaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"jsonData": map[string]interface{}{"onCallApiUrl": oncallServer.URL},
+		})
+	}))
+	t.Cleanup(grafanaServer.Close)
+
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL:    grafanaServer.URL,
+		APIKey: "sa-token",
+	})
+
+	result, err := getAlertGroup(ctx, GetAlertGroupParams{AlertGroupID: "I12345"})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	require.Equal(t, "I12345", result.ID)
+	require.Equal(t, "user-1", result.AcknowledgedBy)
+	require.Equal(t, "", result.ResolvedBy)
+	require.Equal(t, "", result.SilencedAt)
+	require.NotNil(t, result.LastAlert)
+	require.Equal(t, "A1", result.LastAlert.ID)
+	require.Equal(t, "2026-05-01T02:00:00Z", result.LastAlert.CreatedAt)
+
+	var payload map[string]interface{}
+	require.NoError(t, json.Unmarshal(result.LastAlert.Payload, &payload))
+	require.Equal(t, "TestRule", payload["ruleName"])
+	require.Equal(t, "hello", payload["message"])
+}
+
+func TestGetAlertGroup_EmptyID(t *testing.T) {
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL:    "http://unused",
+		APIKey: "sa-token",
+	})
+	_, err := getAlertGroup(ctx, GetAlertGroupParams{AlertGroupID: "   "})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "alertGroupId is required")
+}

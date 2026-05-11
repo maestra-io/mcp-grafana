@@ -490,15 +490,67 @@ type GetAlertGroupParams struct {
 	AlertGroupID string `json:"alertGroupId" jsonschema:"required,description=The ID of the alert group to retrieve"`
 }
 
-func getAlertGroup(ctx context.Context, args GetAlertGroupParams) (*aapi.AlertGroup, error) {
-	alertGroupService, err := getAlertGroupServiceFromContext(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting OnCall alert group service: %w", err)
+// LastAlertPayload is the raw integration-specific payload of the most recent
+// alert in an alert group. The shape varies by source (Alertmanager,
+// Prometheus, webhook, etc.); keep as RawMessage to avoid lossy parsing.
+type LastAlertPayload = json.RawMessage
+
+// LastAlert is the most recent individual alert in an alert group, returned by
+// the OnCall detail endpoint.
+type LastAlert struct {
+	ID        string           `json:"id,omitempty"`
+	CreatedAt string           `json:"created_at,omitempty"`
+	Payload   LastAlertPayload `json:"payload,omitempty"`
+}
+
+// DetailedAlertGroup mirrors aapi.AlertGroup and adds fields returned by the
+// OnCall API that the upstream amixr-api-go-client struct silently drops
+// (acknowledged_by, resolved_by, silenced_at, last_alert).
+type DetailedAlertGroup struct {
+	ID             string            `json:"id"`
+	IntegrationID  string            `json:"integration_id"`
+	RouteID        string            `json:"route_id"`
+	AlertsCount    int               `json:"alerts_count"`
+	State          string            `json:"state"`
+	CreatedAt      string            `json:"created_at"`
+	ResolvedAt     string            `json:"resolved_at"`
+	AcknowledgedAt string            `json:"acknowledged_at"`
+	Title          string            `json:"title"`
+	Permalinks     map[string]string `json:"permalinks"`
+	AcknowledgedBy string            `json:"acknowledged_by,omitempty"`
+	ResolvedBy     string            `json:"resolved_by,omitempty"`
+	SilencedAt     string            `json:"silenced_at,omitempty"`
+	LastAlert      *LastAlert        `json:"last_alert,omitempty"`
+}
+
+// getAlertGroup fetches a single alert group via the OnCall HTTP API directly
+// instead of through amixr-api-go-client's AlertGroupService.GetAlertGroup,
+// which unmarshals into a struct that doesn't declare acknowledged_by,
+// resolved_by, silenced_at, or last_alert and therefore drops them.
+func getAlertGroup(ctx context.Context, args GetAlertGroupParams) (*DetailedAlertGroup, error) {
+	alertGroupID := strings.TrimSpace(args.AlertGroupID)
+	if alertGroupID == "" {
+		return nil, fmt.Errorf("alertGroupId is required")
 	}
 
-	alertGroup, _, err := alertGroupService.GetAlertGroup(args.AlertGroupID)
+	client, err := oncallClientFromContext(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("getting OnCall alert group %s: %w", args.AlertGroupID, err)
+		return nil, fmt.Errorf("getting OnCall client: %w", err)
+	}
+
+	escapedID := url.PathEscape(alertGroupID)
+	path := fmt.Sprintf("alert_groups/%s/", escapedID)
+	req, err := client.NewRequest("GET", path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating get_alert_group request: %w", err)
+	}
+
+	var alertGroup *DetailedAlertGroup
+	if _, err = client.Do(req, &alertGroup); err != nil {
+		return nil, fmt.Errorf("getting OnCall alert group %s: %w", alertGroupID, err)
+	}
+	if alertGroup == nil {
+		return nil, fmt.Errorf("getting OnCall alert group %s: empty response", alertGroupID)
 	}
 
 	return alertGroup, nil
@@ -506,7 +558,7 @@ func getAlertGroup(ctx context.Context, args GetAlertGroupParams) (*aapi.AlertGr
 
 var GetAlertGroup = mcpgrafana.MustTool(
 	"get_alert_group",
-	"Get a specific alert group from Grafana OnCall by its ID. Returns the full alert group details.",
+	"Get a specific alert group from Grafana OnCall by its ID. Returns the full alert group details, including fields not exposed by list_alert_groups: acknowledged_by, resolved_by, silenced_at, and last_alert (most recent individual alert with its raw payload).",
 	getAlertGroup,
 	mcp.WithTitleAnnotation("Get IRM alert group"),
 	mcp.WithIdempotentHintAnnotation(true),
