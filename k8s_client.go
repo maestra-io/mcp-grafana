@@ -203,11 +203,12 @@ func (c *KubernetesClient) mutate(ctx context.Context, method, path string, obj 
 	return result, nil
 }
 
-// Update replaces an existing resource via PUT. The object must carry an
-// up-to-date metadata.resourceVersion (Grafana's apiserver enforces
-// optimistic concurrency and rejects a stale or missing one with HTTP 409);
-// the caller is responsible for reading and injecting it. namespace and name
-// are validated as single, safe path segments before use.
+// Update replaces an existing resource via PUT. metadata.resourceVersion is
+// optional: include it for optimistic concurrency (the apiserver rejects a
+// stale one with HTTP 409); omit it for an unconditional replace. The caller
+// chooses the semantics — updateDashboardV2 strips it for a last-write-wins
+// overwrite. namespace and name are validated as single, safe path segments
+// before use.
 func (c *KubernetesClient) Update(ctx context.Context, desc ResourceDescriptor, namespace, name string, obj map[string]interface{}) (map[string]interface{}, error) {
 	if err := validatePathSegment("namespace", namespace); err != nil {
 		return nil, err
