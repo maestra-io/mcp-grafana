@@ -98,7 +98,10 @@ type v2crServer struct {
 	lastWriteMethod string
 }
 
+// handler returns an httptest handler: GET serves getStatus/getBody; PUT and
+// POST capture the request body and reply writeStatus (default 200)/writeBody.
 func (s *v2crServer) handler(t *testing.T) http.HandlerFunc {
+	t.Helper()
 	return func(w http.ResponseWriter, r *http.Request) {
 		s.gotMethods = append(s.gotMethods, r.Method)
 		w.Header().Set("Content-Type", "application/json")
@@ -122,10 +125,13 @@ func (s *v2crServer) handler(t *testing.T) http.HandlerFunc {
 	}
 }
 
+// v2ctx returns a context carrying a GrafanaConfig pointed at url.
 func v2ctx(url string) context.Context {
 	return mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{URL: url})
 }
 
+// v2dash builds a minimal v2 dashboard map; a non-empty name sets
+// metadata.name.
 func v2dash(name string) map[string]interface{} {
 	m := map[string]interface{}{
 		"apiVersion": "dashboard.grafana.app/v2beta1",
@@ -168,8 +174,10 @@ func TestUpdateDashboardV2_Create(t *testing.T) {
 	}
 }
 
-// TestUpdateDashboardV2_Update: probe 200 + overwrite -> PUT with injected
-// resourceVersion, forced name, dropped namespace/managedFields, folder anno.
+// TestUpdateDashboardV2_Update: probe 200 + overwrite -> PUT that mirrors
+// saveDashboardViaK8s — server-managed metadata stripped (incl. uid and
+// resourceVersion: an unconditional replace, no TOCTOU 409), name forced,
+// folder annotation written.
 func TestUpdateDashboardV2_Update(t *testing.T) {
 	srv := &v2crServer{getStatus: http.StatusOK,
 		getBody:   map[string]interface{}{"metadata": map[string]interface{}{"name": "abc", "resourceVersion": "777"}},
@@ -178,8 +186,11 @@ func TestUpdateDashboardV2_Update(t *testing.T) {
 	defer ts.Close()
 
 	d := v2dash("abc")
-	d["metadata"].(map[string]interface{})["namespace"] = "should-be-dropped"
-	d["metadata"].(map[string]interface{})["managedFields"] = []interface{}{"x"}
+	dm := d["metadata"].(map[string]interface{})
+	dm["namespace"] = "should-be-dropped"
+	dm["managedFields"] = []interface{}{"x"}
+	dm["uid"] = "stale-foreign-uid"
+	dm["resourceVersion"] = "stale-1"
 	_, err := updateDashboardWithFullJSON(v2ctx(ts.URL), UpdateDashboardParams{Dashboard: d, FolderUID: "f2", Overwrite: true})
 	if err != nil {
 		t.Fatalf("error: %v", err)
@@ -188,17 +199,13 @@ func TestUpdateDashboardV2_Update(t *testing.T) {
 		t.Fatalf("write method = %s, want PUT", srv.lastWriteMethod)
 	}
 	meta, _ := srv.lastWriteBody["metadata"].(map[string]interface{})
-	if meta["resourceVersion"] != "777" {
-		t.Errorf("PUT resourceVersion = %v, want 777", meta["resourceVersion"])
-	}
 	if meta["name"] != "abc" {
 		t.Errorf("PUT metadata.name = %v, want abc", meta["name"])
 	}
-	if _, ok := meta["namespace"]; ok {
-		t.Error("PUT body still carries metadata.namespace")
-	}
-	if _, ok := meta["managedFields"]; ok {
-		t.Error("PUT body still carries metadata.managedFields")
+	for _, k := range []string{"resourceVersion", "uid", "namespace", "managedFields"} {
+		if _, ok := meta[k]; ok {
+			t.Errorf("PUT body still carries server-managed metadata.%s", k)
+		}
 	}
 	if ann, _ := meta["annotations"].(map[string]interface{}); ann["grafana.app/folder"] != "f2" {
 		t.Errorf("folder annotation = %v, want f2", meta["annotations"])
@@ -366,5 +373,66 @@ func TestUpdateDashboardV2_DoesNotMutateCallerArg(t *testing.T) {
 	}
 	if _, ok := callerMeta["annotations"]; ok {
 		t.Error("caller metadata was mutated: annotations leaked back")
+	}
+}
+
+// TestUpdateDashboardV2_BadAnnotationsType: metadata.annotations of a
+// non-object type fails loudly before any HTTP request.
+func TestUpdateDashboardV2_BadAnnotationsType(t *testing.T) {
+	called := false
+	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+	defer ts.Close()
+
+	d := map[string]interface{}{
+		"apiVersion": "dashboard.grafana.app/v2beta1", "kind": "Dashboard",
+		"metadata": map[string]interface{}{"name": "abc", "annotations": "oops"},
+	}
+	_, err := updateDashboardWithFullJSON(v2ctx(ts.URL), UpdateDashboardParams{Dashboard: d, Overwrite: true})
+	if err == nil || !strings.Contains(err.Error(), "metadata.annotations is not an object") {
+		t.Errorf("error = %v, want a metadata.annotations type error", err)
+	}
+	if called {
+		t.Error("an HTTP request was issued despite malformed annotations")
+	}
+}
+
+// TestUpdateDashboardV2_PreservesExistingAnnotations: an existing annotation
+// is kept alongside the injected folder annotation, and the caller's
+// annotations map is not mutated.
+func TestUpdateDashboardV2_PreservesExistingAnnotations(t *testing.T) {
+	srv := &v2crServer{getStatus: http.StatusOK,
+		getBody:   map[string]interface{}{"metadata": map[string]interface{}{"name": "abc", "resourceVersion": "1"}},
+		writeBody: map[string]interface{}{"metadata": map[string]interface{}{"name": "abc"}}}
+	ts := httptest.NewServer(srv.handler(t))
+	defer ts.Close()
+
+	d := v2dash("abc")
+	callerAnn := map[string]interface{}{"foo": "bar"}
+	d["metadata"].(map[string]interface{})["annotations"] = callerAnn
+	_, err := updateDashboardWithFullJSON(v2ctx(ts.URL), UpdateDashboardParams{Dashboard: d, FolderUID: "f9", Overwrite: true})
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	meta, _ := srv.lastWriteBody["metadata"].(map[string]interface{})
+	ann, _ := meta["annotations"].(map[string]interface{})
+	if ann["foo"] != "bar" || ann["grafana.app/folder"] != "f9" {
+		t.Errorf("PUT annotations = %v, want foo=bar and grafana.app/folder=f9", ann)
+	}
+	if _, leaked := callerAnn["grafana.app/folder"]; leaked {
+		t.Error("caller annotations map was mutated: folder annotation leaked back")
+	}
+}
+
+// TestUpdateDashboardV2_EmptyUIDGuard: a generated-name create whose response
+// carries no metadata.name surfaces an explicit error rather than a bogus
+// empty UID.
+func TestUpdateDashboardV2_EmptyUIDGuard(t *testing.T) {
+	srv := &v2crServer{writeBody: map[string]interface{}{}}
+	ts := httptest.NewServer(srv.handler(t))
+	defer ts.Close()
+
+	_, err := updateDashboardWithFullJSON(v2ctx(ts.URL), UpdateDashboardParams{Dashboard: v2dash("")})
+	if err == nil || !strings.Contains(err.Error(), "carried no metadata.name") {
+		t.Errorf("error = %v, want 'carried no metadata.name' guard", err)
 	}
 }

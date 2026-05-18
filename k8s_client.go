@@ -215,7 +215,10 @@ func (c *KubernetesClient) Update(ctx context.Context, desc ResourceDescriptor, 
 	if err := validatePathSegment("name", name); err != nil {
 		return nil, err
 	}
-	path := desc.BasePath(namespace) + "/" + url.PathEscape(name)
+	// validatePathSegment restricts name/namespace to [A-Za-z0-9._-], all of
+	// which are RFC 3986 unreserved, so the segment is URL-safe as-is and is
+	// concatenated raw — consistent with Get/List.
+	path := desc.BasePath(namespace) + "/" + name
 	return c.mutate(ctx, http.MethodPut, path, obj)
 }
 

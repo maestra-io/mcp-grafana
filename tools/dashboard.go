@@ -51,7 +51,7 @@ type UpdateDashboardParams struct {
 
 	// For targeted updates using patch operations (preferred for existing dashboards)
 	UID        string           `json:"uid,omitempty" jsonschema:"description=UID of existing dashboard to update. Must be used together with 'operations'. Providing 'uid' without 'operations' will fail."`
-	Operations []PatchOperation `json:"operations,omitempty" jsonschema:"description=Array of patch operations for targeted updates. More efficient than full dashboard JSON for small changes. Common paths: '$.templating.list/-' to add a variable\\, '$.annotations.list/-' to add a saved dashboard annotation query/definition\\, '$.panels[0].targets[0].expr' to replace a panel query."`
+	Operations []PatchOperation `json:"operations,omitempty" jsonschema:"description=Array of patch operations for targeted updates. More efficient than full dashboard JSON for small changes. Common paths: '$.templating.list/-' to add a variable\\, '$.annotations.list/-' to add a saved dashboard annotation query/definition\\, '$.panels[0].targets[0].expr' to replace a panel query. Not v2-safe: patch mode round-trips through the legacy endpoint and will down-convert a v2 (Kubernetes-schema) dashboard to v1. Edit v2 dashboards via full-JSON mode instead."`
 
 	// Common parameters
 	FolderUID string `json:"folderUid,omitempty" jsonschema:"description=The UID of the dashboard's folder. For v2 dashboards this is written as the grafana.app/folder metadata annotation."`
@@ -167,13 +167,21 @@ const (
 // or fragment characters (SSRF / namespace-scope escape).
 var k8sVersionRe = regexp.MustCompile(`^v[0-9]+((alpha|beta)[0-9]+)?$`)
 
-// k8sServerManagedMetaKeys are apiserver-owned metadata fields. They are
-// stripped before a CREATE: a non-empty resourceVersion makes the apiserver
-// reject the create outright; the rest are ignored/overwritten server-side,
-// so dropping them keeps a re-used or exported object createable.
+// k8sServerManagedMetaKeys are apiserver-owned metadata fields stripped
+// before both create and update, mirroring Grafana's own saveDashboardViaK8s
+// (which clears uid/resourceVersion/managedFields/finalizers for either
+// verb). Leaving a non-empty resourceVersion makes a create fail outright;
+// leaving a stale/foreign uid is the documented restore-class footgun; the
+// rest are ignored/overwritten server-side. Clearing resourceVersion on
+// update also makes the write an unconditional replace (the contract when
+// overwrite=true), avoiding a probe-to-write TOCTOU 409.
 var k8sServerManagedMetaKeys = []string{
 	"resourceVersion", "uid", "creationTimestamp",
-	"generation", "managedFields", "selfLink",
+	"generation", "managedFields", "selfLink", "finalizers",
+	// namespace is dropped so the body never contradicts the URL namespace
+	// (the apiserver derives it from the path); a mismatching body
+	// namespace is otherwise a hard 400.
+	"namespace",
 }
 
 // kubernetesDashboardInfo reports whether the dashboard JSON is a
@@ -288,12 +296,15 @@ func updateDashboardWithFullJSON(ctx context.Context, args UpdateDashboardParams
 
 // updateDashboardV2 writes a v2 (Kubernetes-schema) dashboard through
 // Grafana's apiserver (/apis/dashboard.grafana.app/<ver>/namespaces/<ns>/
-// dashboards). An existing resource is updated with PUT after its live
-// metadata.resourceVersion is read (the apiserver enforces optimistic
-// concurrency); a genuinely absent one (404 from the existence probe) is
-// created with POST. Only a 404 triggers create — auth/transient/server
-// errors surface instead of being mistaken for "absent". Folder placement is
-// carried via the grafana.app/folder annotation.
+// dashboards). It mirrors Grafana's own saveDashboardViaK8s: server-managed
+// metadata is stripped and the request body's metadata.name is forced to the
+// resource name for BOTH verbs. A genuinely absent resource (404 from the
+// existence probe) is created with POST; an existing one is replaced with
+// PUT. resourceVersion is intentionally NOT sent — the write is an
+// unconditional replace (the contract when overwrite=true), which avoids a
+// probe-to-write TOCTOU 409. Only a 404 triggers create; auth/transient/
+// server probe errors surface instead of being mistaken for "absent".
+// Folder placement is carried via the grafana.app/folder annotation.
 //
 // Legacy-only fields: args.Message and args.UserID have no apiserver
 // representation and are ignored for v2. args.Overwrite IS honoured — an
@@ -303,13 +314,16 @@ func updateDashboardWithFullJSON(ctx context.Context, args UpdateDashboardParams
 // synthetic Status="success" on a 2xx; ID/URL/Title/Version are shaped
 // differently by the apiserver and are intentionally left nil.
 func updateDashboardV2(ctx context.Context, args UpdateDashboardParams, apiVersion string) (*models.PostDashboardOKBody, error) {
+	// A fresh client per call matches the rest of the codebase (the legacy
+	// OpenAPI client and every other k8s-style tool are built per request).
+	// CloseIdleConnections is deliberately not called: BuildTransport wraps
+	// the (possibly cloned) *http.Transport in otelhttp + auth round-trippers
+	// that do not forward CloseIdleConnections, so it would be a misleading
+	// no-op. Idle conns are reaped by the transport's own IdleConnTimeout.
 	kc, err := mcpgrafana.NewKubernetesClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("create kubernetes client: %w", err)
 	}
-	// NewKubernetesClient may clone a dedicated transport (TLS path); release
-	// idle connections so a per-call client does not leak the pool.
-	defer kc.HTTPClient.CloseIdleConnections()
 
 	desc := mcpgrafana.ResourceDescriptor{
 		Group:    k8sDashboardGroup,
@@ -339,30 +353,30 @@ func updateDashboardV2(ctx context.Context, args UpdateDashboardParams, apiVersi
 		ann[folderAnnotation] = args.FolderUID
 	}
 
+	// Strip server-managed metadata and force the name for both verbs (after
+	// the folder annotation, which lives outside the stripped set).
+	stripServerManagedMeta(meta)
+	if name != "" {
+		meta["name"] = name
+	} else {
+		// Let the apiserver generate the name; an explicit empty string
+		// would be rejected.
+		delete(meta, "name")
+	}
+
 	var result map[string]interface{}
 	if name != "" {
-		cur, getErr := kc.Get(ctx, desc, ns, name)
+		_, getErr := kc.Get(ctx, desc, ns, name)
 		switch {
 		case getErr == nil:
 			if !args.Overwrite {
 				return nil, fmt.Errorf("dashboard %q already exists; set overwrite=true to replace it", name)
 			}
-			// The PUT body must agree with the URL and carry the live
-			// resourceVersion for optimistic concurrency.
-			meta["name"] = name
-			delete(meta, "namespace")
-			delete(meta, "managedFields")
-			rv := safeString(safeObject(cur, "metadata"), "resourceVersion")
-			if rv == "" {
-				return nil, fmt.Errorf("could not read resourceVersion of existing dashboard %q", name)
-			}
-			meta["resourceVersion"] = rv
 			result, err = kc.Update(ctx, desc, ns, name, dash)
 			if err != nil {
 				return nil, fmt.Errorf("update existing v2 dashboard %q: %w", name, err)
 			}
 		case isKubernetesNotFound(getErr):
-			stripServerManagedMeta(meta)
 			result, err = kc.Create(ctx, desc, ns, dash)
 			if err != nil {
 				return nil, fmt.Errorf("create v2 dashboard %q: %w", name, err)
@@ -371,7 +385,6 @@ func updateDashboardV2(ctx context.Context, args UpdateDashboardParams, apiVersi
 			return nil, fmt.Errorf("probe existing v2 dashboard %q: %w", name, getErr)
 		}
 	} else {
-		stripServerManagedMeta(meta)
 		result, err = kc.Create(ctx, desc, ns, dash)
 		if err != nil {
 			return nil, fmt.Errorf("create v2 dashboard: %w", err)
@@ -497,7 +510,7 @@ var GetDashboardByUID = mcpgrafana.MustTool(
 
 var UpdateDashboard = mcpgrafana.MustTool(
 	"update_dashboard",
-	"Create or update a dashboard. Two modes: (1) Full JSON — provide 'dashboard' for new dashboards or complete replacements. (2) Patch — provide 'uid' + 'operations' to make targeted changes to an existing dashboard. One of these two modes is required; 'folderUid'\\, 'message'\\, and 'overwrite' are supplementary and do nothing on their own. Dashboard authoring guidance: if a saved query must support one\\, many\\, or All values from a multi-select variable inside a regex expression or matcher\\, save '${var:regex}' rather than plain '$var'. Saved dashboard annotation queries/definitions must be written into dashboard JSON under 'annotations.list'; the create_annotation tool creates annotation events and does not add a reusable dashboard annotation query/definition to the saved dashboard. For stat panels over the current dashboard range\\, make the query return the range-level result the stat should display; panel-side reduction only reduces returned series and does not compute peak-over-range or ratio-of-peaks semantics for you. Patch operations support JSONPaths like '$.panels[0].targets[0].expr'\\, '$.panels[1].title'\\, '$.panels[2].targets[0].datasource'\\, '$.templating.list/-'\\, and '$.annotations.list/-'. Append to arrays with '/- ' syntax: '$.panels/- '. Remove by index: {\"op\": \"remove\"\\, \"path\": \"$.panels[2]\"}. Multiple removes on the same array are automatically reordered to avoid index-shifting issues. Note: only numeric array indices are supported in patch paths; filter expressions like [?(@.id==2)] and wildcards like [*] are not supported. v2 (Kubernetes-schema) dashboards — full JSON with a top-level apiVersion 'dashboard.grafana.app/<ver>' and a 'spec' — are written through Grafana's apiserver so v2-only fields (AutoGridLayout; conditionalRendering / show-hide rules) survive instead of being down-converted by the legacy endpoint; in Grafana Cloud or multi-org OSS set the GRAFANA_DASHBOARD_NAMESPACE env var (default 'default').",
+	"Create or update a dashboard. Two modes: (1) Full JSON — provide 'dashboard' for new dashboards or complete replacements. (2) Patch — provide 'uid' + 'operations' to make targeted changes to an existing dashboard. One of these two modes is required; 'folderUid'\\, 'message'\\, and 'overwrite' are supplementary and do nothing on their own. Dashboard authoring guidance: if a saved query must support one\\, many\\, or All values from a multi-select variable inside a regex expression or matcher\\, save '${var:regex}' rather than plain '$var'. Saved dashboard annotation queries/definitions must be written into dashboard JSON under 'annotations.list'; the create_annotation tool creates annotation events and does not add a reusable dashboard annotation query/definition to the saved dashboard. For stat panels over the current dashboard range\\, make the query return the range-level result the stat should display; panel-side reduction only reduces returned series and does not compute peak-over-range or ratio-of-peaks semantics for you. Patch operations support JSONPaths like '$.panels[0].targets[0].expr'\\, '$.panels[1].title'\\, '$.panels[2].targets[0].datasource'\\, '$.templating.list/-'\\, and '$.annotations.list/-'. Append to arrays with '/- ' syntax: '$.panels/- '. Remove by index: {\"op\": \"remove\"\\, \"path\": \"$.panels[2]\"}. Multiple removes on the same array are automatically reordered to avoid index-shifting issues. Note: only numeric array indices are supported in patch paths; filter expressions like [?(@.id==2)] and wildcards like [*] are not supported. v2 (Kubernetes-schema) dashboards — full JSON with a top-level apiVersion 'dashboard.grafana.app/<ver>' and a 'spec' — are written through Grafana's apiserver so v2-only fields (AutoGridLayout; conditionalRendering / show-hide rules) survive instead of being down-converted by the legacy endpoint; in Grafana Cloud or multi-org OSS set the GRAFANA_DASHBOARD_NAMESPACE env var (default 'default'). Patch mode does NOT support v2: it fetches via the legacy endpoint and rewrites via legacy save\\, so patching a v2 dashboard down-converts it to v1 (AutoGridLayout/conditionalRendering lost). To edit a v2 dashboard fetch its full JSON\\, modify it\\, and resubmit it via full-JSON mode.",
 	updateDashboard,
 	mcp.WithTitleAnnotation("Create or update dashboard"),
 	mcp.WithDestructiveHintAnnotation(true),
