@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `update_dashboard` now writes v2 (Kubernetes-schema) dashboards through Grafana's apiserver, preserving `AutoGridLayout` / `conditionalRendering` fields the legacy `/api/dashboards/db` endpoint silently down-converts. Detection is automatic on the top-level `apiVersion` (`dashboard.grafana.app/<ver>`). Namespace defaults to `default`; override via the `GRAFANA_DASHBOARD_NAMESPACE` env var for Grafana Cloud (`stacks-<id>`) or multi-org OSS (`org-<N>`). `overwrite` is honored (an existing dashboard with `overwrite=false` is not replaced); `message`/`userId` are legacy-only and ignored for v2.
+
 ### Fixed
 
 - `oncall.get_alert_group` no longer silently drops `acknowledged_by`, `resolved_by`, `silenced_at`, and `last_alert` fields. The upstream amixr-api-go-client `AlertGroup` struct only declares the 10 list-shape fields, so unmarshaling the detail-endpoint response through that struct truncated the response. The wrapper now decodes into a local `DetailedAlertGroup` struct and calls the API directly, mirroring the pattern already used by `alertGroupAction`.
