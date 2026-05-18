@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
 	"slices"
 	"sort"
@@ -143,8 +144,43 @@ func updateDashboardWithPatches(ctx context.Context, args UpdateDashboardParams)
 	})
 }
 
-// updateDashboardWithFullJSON performs a traditional full dashboard update
+// k8sDashboardGroup is the Kubernetes-style API group Grafana exposes for the
+// v2 dashboard schema (AutoGridLayout, conditionalRendering, etc.).
+const k8sDashboardGroup = "dashboard.grafana.app"
+
+// kubernetesDashboardInfo reports whether the dashboard JSON is a
+// Kubernetes-style v2 object (apiVersion: "dashboard.grafana.app/<ver>").
+// The legacy /api/dashboards/db endpoint lossily down-converts such objects
+// (AutoGridLayout -> GridLayout, conditionalRendering dropped), so these must
+// be written through the Kubernetes-style apiserver instead.
+func kubernetesDashboardInfo(dash map[string]interface{}) (version string, ok bool) {
+	av, _ := dash["apiVersion"].(string)
+	prefix := k8sDashboardGroup + "/"
+	if !strings.HasPrefix(av, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(av, prefix), true
+}
+
+// dashboardNamespace resolves the apiserver namespace for dashboards.
+// Single-org OSS/on-prem (incl. Maestra) uses "default"; Grafana Cloud uses
+// "stacks-<id>"; multi-org OSS uses "org-<N>". Override via
+// GRAFANA_DASHBOARD_NAMESPACE.
+func dashboardNamespace() string {
+	if ns := os.Getenv("GRAFANA_DASHBOARD_NAMESPACE"); ns != "" {
+		return ns
+	}
+	return "default"
+}
+
+// updateDashboardWithFullJSON performs a full dashboard update. v2 (Kubernetes
+// schema) dashboards are routed through the apiserver to preserve fields the
+// legacy endpoint drops; everything else uses the legacy save endpoint.
 func updateDashboardWithFullJSON(ctx context.Context, args UpdateDashboardParams) (*models.PostDashboardOKBody, error) {
+	if version, ok := kubernetesDashboardInfo(args.Dashboard); ok {
+		return updateDashboardV2(ctx, args, version)
+	}
+
 	c := mcpgrafana.GrafanaClientFromContext(ctx)
 	cmd := &models.SaveDashboardCommand{
 		Dashboard: args.Dashboard,
@@ -160,6 +196,74 @@ func updateDashboardWithFullJSON(ctx context.Context, args UpdateDashboardParams
 		return nil, fmt.Errorf("unable to save dashboard: %w", err)
 	}
 	return dashboard.Payload, nil
+}
+
+// updateDashboardV2 writes a v2 (Kubernetes-schema) dashboard through Grafana's
+// apiserver (/apis/dashboard.grafana.app/<ver>/...). PUT for an existing
+// resource (resourceVersion is fetched first for optimistic concurrency),
+// POST otherwise.
+func updateDashboardV2(ctx context.Context, args UpdateDashboardParams, version string) (*models.PostDashboardOKBody, error) {
+	kc, err := mcpgrafana.NewKubernetesClient(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("kubernetes client: %w", err)
+	}
+	desc := mcpgrafana.ResourceDescriptor{
+		Group:    k8sDashboardGroup,
+		Version:  version,
+		Resource: "dashboards",
+	}
+	ns := dashboardNamespace()
+
+	dash := args.Dashboard
+	meta, _ := dash["metadata"].(map[string]interface{})
+	if meta == nil {
+		meta = map[string]interface{}{}
+		dash["metadata"] = meta
+	}
+	name, _ := meta["name"].(string)
+
+	// Carry folder placement via the apiserver's folder annotation.
+	if args.FolderUID != "" {
+		ann, _ := meta["annotations"].(map[string]interface{})
+		if ann == nil {
+			ann = map[string]interface{}{}
+			meta["annotations"] = ann
+		}
+		ann["grafana.app/folder"] = args.FolderUID
+	}
+
+	var result map[string]interface{}
+	if name != "" {
+		if cur, getErr := kc.Get(ctx, desc, ns, name); getErr == nil {
+			// Existing resource: PUT with the live resourceVersion.
+			if curMeta, ok := cur["metadata"].(map[string]interface{}); ok {
+				if rv, ok := curMeta["resourceVersion"].(string); ok && rv != "" {
+					meta["resourceVersion"] = rv
+				}
+			}
+			result, err = kc.Update(ctx, desc, ns, name, dash)
+		} else {
+			// Not found: create with the requested name.
+			result, err = kc.Create(ctx, desc, ns, dash)
+		}
+	} else {
+		result, err = kc.Create(ctx, desc, ns, dash)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("unable to save v2 dashboard: %w", err)
+	}
+
+	uid := name
+	if rm, ok := result["metadata"].(map[string]interface{}); ok {
+		if n, ok := rm["name"].(string); ok && n != "" {
+			uid = n
+		}
+	}
+	status := "success"
+	return &models.PostDashboardOKBody{
+		UID:    &uid,
+		Status: &status,
+	}, nil
 }
 
 // sortArrayRemovesDescending reorders remove operations on the same array

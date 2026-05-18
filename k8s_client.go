@@ -1,6 +1,7 @@
 package mcpgrafana
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -163,6 +164,62 @@ func (c *KubernetesClient) List(ctx context.Context, desc ResourceDescriptor, na
 		return nil, fmt.Errorf("decode list response: %w", err)
 	}
 	return &list, nil
+}
+
+// Update replaces an existing resource via PUT. The object must carry an
+// up-to-date metadata.resourceVersion; the caller is responsible for fetching
+// it (Grafana's apiserver enforces optimistic concurrency).
+func (c *KubernetesClient) Update(ctx context.Context, desc ResourceDescriptor, namespace, name string, obj map[string]interface{}) (map[string]interface{}, error) {
+	if err := validatePathSegment("namespace", namespace); err != nil {
+		return nil, err
+	}
+	if err := validatePathSegment("name", name); err != nil {
+		return nil, err
+	}
+
+	payload, err := json.Marshal(obj)
+	if err != nil {
+		return nil, fmt.Errorf("marshal object: %w", err)
+	}
+
+	path := desc.BasePath(namespace) + "/" + name
+
+	body, err := c.doRequest(ctx, http.MethodPut, path, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return result, nil
+}
+
+// Create posts a new resource to the collection. The object's metadata.name
+// (if set) becomes the resource name; otherwise the apiserver generates one.
+func (c *KubernetesClient) Create(ctx context.Context, desc ResourceDescriptor, namespace string, obj map[string]interface{}) (map[string]interface{}, error) {
+	if err := validatePathSegment("namespace", namespace); err != nil {
+		return nil, err
+	}
+
+	payload, err := json.Marshal(obj)
+	if err != nil {
+		return nil, fmt.Errorf("marshal object: %w", err)
+	}
+
+	path := desc.BasePath(namespace)
+
+	body, err := c.doRequest(ctx, http.MethodPost, path, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return result, nil
 }
 
 // KubernetesAPIError is returned when the server responds with a non-2xx status.
