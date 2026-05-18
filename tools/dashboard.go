@@ -3,7 +3,9 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"regexp"
 	"slices"
@@ -159,7 +161,14 @@ func kubernetesDashboardInfo(dash map[string]interface{}) (version string, ok bo
 	if !strings.HasPrefix(av, prefix) {
 		return "", false
 	}
-	return strings.TrimPrefix(av, prefix), true
+	v := strings.TrimPrefix(av, prefix)
+	// The version must be a single, non-empty path segment (e.g. "v2beta1").
+	// An empty or multi-segment suffix ("dashboard.grafana.app/" or
+	// ".../v2beta1/x") would otherwise build a malformed apiserver path.
+	if v == "" || strings.ContainsAny(v, "/\\") {
+		return "", false
+	}
+	return v, true
 }
 
 // dashboardNamespace resolves the apiserver namespace for dashboards.
@@ -171,6 +180,14 @@ func dashboardNamespace() string {
 		return ns
 	}
 	return "default"
+}
+
+// isKubernetesNotFound reports whether err is an apiserver 404. Used to
+// distinguish "resource absent, create it" from auth/transient/validation
+// failures that must not be silently turned into a create.
+func isKubernetesNotFound(err error) bool {
+	var apiErr *mcpgrafana.KubernetesAPIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
 }
 
 // updateDashboardWithFullJSON performs a full dashboard update. v2 (Kubernetes
@@ -234,7 +251,9 @@ func updateDashboardV2(ctx context.Context, args UpdateDashboardParams, version 
 
 	var result map[string]interface{}
 	if name != "" {
-		if cur, getErr := kc.Get(ctx, desc, ns, name); getErr == nil {
+		cur, getErr := kc.Get(ctx, desc, ns, name)
+		switch {
+		case getErr == nil:
 			// Existing resource: PUT with the live resourceVersion.
 			if curMeta, ok := cur["metadata"].(map[string]interface{}); ok {
 				if rv, ok := curMeta["resourceVersion"].(string); ok && rv != "" {
@@ -242,9 +261,13 @@ func updateDashboardV2(ctx context.Context, args UpdateDashboardParams, version 
 				}
 			}
 			result, err = kc.Update(ctx, desc, ns, name, dash)
-		} else {
-			// Not found: create with the requested name.
+		case isKubernetesNotFound(getErr):
+			// Genuinely absent: create with the requested name. Only a
+			// 404 means "create"; auth/transient/validation errors must
+			// surface instead of being mistaken for a missing resource.
 			result, err = kc.Create(ctx, desc, ns, dash)
+		default:
+			return nil, fmt.Errorf("probe existing v2 dashboard %q: %w", name, getErr)
 		}
 	} else {
 		result, err = kc.Create(ctx, desc, ns, dash)

@@ -24,6 +24,9 @@ func TestKubernetesDashboardInfo(t *testing.T) {
 		{"other group", map[string]interface{}{"apiVersion": "folder.grafana.app/v1beta1"}, "", false},
 		{"non-string apiVersion", map[string]interface{}{"apiVersion": 1}, "", false},
 		{"empty", map[string]interface{}{}, "", false},
+		{"empty version suffix", map[string]interface{}{"apiVersion": "dashboard.grafana.app/"}, "", false},
+		{"multi-segment suffix", map[string]interface{}{"apiVersion": "dashboard.grafana.app/v2beta1/x"}, "", false},
+		{"backslash in suffix", map[string]interface{}{"apiVersion": "dashboard.grafana.app/v2\\bad"}, "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -143,6 +146,42 @@ func TestUpdateDashboardV2_Update(t *testing.T) {
 	}
 	ann, _ := md["annotations"].(map[string]interface{})
 	_ = ann // folder annotation only set when FolderUID provided; not asserted here
+}
+
+// A non-404 GET probe failure (auth/transient/server error) must surface as
+// an error and must NOT be mistaken for "absent -> create".
+func TestUpdateDashboardV2_ProbeError_NoCreate(t *testing.T) {
+	var sawPost bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"kind": "Status", "code": 500})
+		case http.MethodPost:
+			sawPost = true
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"metadata": map[string]interface{}{"name": "x"}})
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+		}
+	}))
+	defer ts.Close()
+
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{URL: ts.URL})
+	_, err := updateDashboardWithFullJSON(ctx, UpdateDashboardParams{
+		Dashboard: map[string]interface{}{
+			"apiVersion": "dashboard.grafana.app/v2beta1",
+			"kind":       "Dashboard",
+			"metadata":   map[string]interface{}{"name": "abc"},
+			"spec":       map[string]interface{}{"title": "X"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error when existence probe returns 500")
+	}
+	if sawPost {
+		t.Error("must NOT POST (create) when the GET probe failed with a non-404 error")
+	}
 }
 
 // Routing decision for legacy (v1) dashboards is asserted by
