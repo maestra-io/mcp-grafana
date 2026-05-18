@@ -1,12 +1,14 @@
 package mcpgrafana
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -95,11 +97,22 @@ func (c *KubernetesClient) Discover(ctx context.Context) (*ResourceRegistry, err
 }
 
 // validatePathSegment checks that a user-supplied path segment (namespace or
-// resource name) does not contain path separators, which could lead to path
-// traversal.
+// resource name) is a safe single path segment. It must be non-empty, must
+// not be "." or "..", and may contain only [A-Za-z0-9._-] — which covers
+// Grafana namespaces ("default", "stacks-<id>", "org-<N>") and dashboard
+// UIDs while rejecting anything that could inject a path, query, or fragment
+// into the apiserver URL (e.g. "/", "\\", "..", "?", "#", "@", "%", spaces).
+var pathSegmentRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
 func validatePathSegment(kind, value string) error {
-	if strings.Contains(value, "/") || strings.Contains(value, "\\") {
-		return fmt.Errorf("%s %q must not contain path separators", kind, value)
+	if value == "" {
+		return fmt.Errorf("%s must not be empty", kind)
+	}
+	if value == "." || value == ".." {
+		return fmt.Errorf("%s %q must not be a relative path segment", kind, value)
+	}
+	if !pathSegmentRe.MatchString(value) {
+		return fmt.Errorf("%s %q contains characters not allowed in an API path segment", kind, value)
 	}
 	return nil
 }
@@ -163,6 +176,63 @@ func (c *KubernetesClient) List(ctx context.Context, desc ResourceDescriptor, na
 		return nil, fmt.Errorf("decode list response: %w", err)
 	}
 	return &list, nil
+}
+
+// mutate marshals obj, issues a write request, and decodes the response.
+// A 2xx with an empty body (legal for some apiserver writes) yields an empty
+// map rather than a decode error, so a successful write is never reported as
+// a failure. Shared by Update and Create.
+func (c *KubernetesClient) mutate(ctx context.Context, method, path string, obj map[string]interface{}) (map[string]interface{}, error) {
+	payload, err := json.Marshal(obj)
+	if err != nil {
+		return nil, fmt.Errorf("marshal object: %w", err)
+	}
+
+	body, err := c.doRequest(ctx, method, path, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return map[string]interface{}{}, nil
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decode %s response: %w", method, err)
+	}
+	return result, nil
+}
+
+// Update replaces an existing resource via PUT. metadata.resourceVersion is
+// optional: include it for optimistic concurrency (the apiserver rejects a
+// stale one with HTTP 409); omit it for an unconditional replace. The caller
+// chooses the semantics — updateDashboardV2 strips it for a last-write-wins
+// overwrite. namespace and name are validated as single, safe path segments
+// before use.
+func (c *KubernetesClient) Update(ctx context.Context, desc ResourceDescriptor, namespace, name string, obj map[string]interface{}) (map[string]interface{}, error) {
+	if err := validatePathSegment("namespace", namespace); err != nil {
+		return nil, err
+	}
+	if err := validatePathSegment("name", name); err != nil {
+		return nil, err
+	}
+	// validatePathSegment restricts name/namespace to [A-Za-z0-9._-], all of
+	// which are RFC 3986 unreserved, so the segment is URL-safe as-is and is
+	// concatenated raw — consistent with Get/List.
+	path := desc.BasePath(namespace) + "/" + name
+	return c.mutate(ctx, http.MethodPut, path, obj)
+}
+
+// Create posts a new resource to the collection. The object's metadata.name
+// (if set) becomes the resource name; otherwise the apiserver generates one.
+// Server-managed metadata (resourceVersion in particular) must not be present
+// on the object — the caller is responsible for stripping it. namespace is
+// validated as a single, safe path segment before use.
+func (c *KubernetesClient) Create(ctx context.Context, desc ResourceDescriptor, namespace string, obj map[string]interface{}) (map[string]interface{}, error) {
+	if err := validatePathSegment("namespace", namespace); err != nil {
+		return nil, err
+	}
+	return c.mutate(ctx, http.MethodPost, desc.BasePath(namespace), obj)
 }
 
 // KubernetesAPIError is returned when the server responds with a non-2xx status.
