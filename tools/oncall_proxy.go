@@ -9,9 +9,14 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	mcpgrafana "github.com/grafana/mcp-grafana"
 )
+
+// oncallProxyRequestTimeout bounds a single IRM-proxy HTTP call so a request
+// with no context deadline can't block indefinitely.
+const oncallProxyRequestTimeout = 30 * time.Second
 
 // IRM plugin proxy paths. The proxy prepends "api/internal/v1/" before forwarding.
 const (
@@ -51,7 +56,7 @@ func newOncallProxyClient(ctx context.Context) (*oncallProxyClient, error) {
 	}
 
 	return &oncallProxyClient{
-		httpClient: &http.Client{Transport: transport},
+		httpClient: &http.Client{Transport: transport, Timeout: oncallProxyRequestTimeout},
 		baseURL:    cfg.URL + irmProxyBasePath,
 	}, nil
 }

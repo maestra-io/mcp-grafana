@@ -95,6 +95,10 @@ type onCallAlertGroupInternal struct {
 	ResolvedAt          string            `json:"resolved_at"`
 	AcknowledgedAt      string            `json:"acknowledged_at"`
 	SilencedAt          string            `json:"silenced_at"`
+	RouteID             string            `json:"route_id"`
+	AcknowledgedBy      string            `json:"acknowledged_by"`
+	ResolvedBy          string            `json:"resolved_by"`
+	LastAlert           *LastAlert        `json:"last_alert"`
 	AlertReceiveChannel any               `json:"alert_receive_channel"`
 	Team                any               `json:"team"`
 	Labels              any               `json:"labels"`
@@ -199,6 +203,10 @@ func (ag *onCallAlertGroupInternal) toOnCallAlertGroup() *OnCallAlertGroup {
 		ResolvedAt:     ag.ResolvedAt,
 		AcknowledgedAt: ag.AcknowledgedAt,
 		SilencedAt:     ag.SilencedAt,
+		RouteID:        ag.RouteID,
+		AcknowledgedBy: ag.AcknowledgedBy,
+		ResolvedBy:     ag.ResolvedBy,
+		LastAlert:      ag.LastAlert,
 		Labels:         ag.Labels,
 		Permalinks:     ag.Permalinks,
 	}
