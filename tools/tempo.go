@@ -191,7 +191,7 @@ func queryTempoTraces(ctx context.Context, args QueryTempoTracesParams) ([]Tempo
 
 	var resp tempoSearchResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("unmarshalling Tempo search response (content: %s): %w", string(body), err)
+		return nil, fmt.Errorf("unmarshalling Tempo search response (content: %s): %w", truncateForLog(string(body), 500), err)
 	}
 
 	summaries := make([]TempoTraceSummary, 0, len(resp.Traces))
@@ -312,7 +312,7 @@ func listTempoTagNames(ctx context.Context, args ListTempoTagNamesParams) ([]str
 
 	var resp tempoTagNamesResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("unmarshalling Tempo tag names response (content: %s): %w", string(body), err)
+		return nil, fmt.Errorf("unmarshalling Tempo tag names response (content: %s): %w", truncateForLog(string(body), 500), err)
 	}
 	return resp.TagNames, nil
 }
@@ -375,7 +375,7 @@ func listTempoTagValues(ctx context.Context, args ListTempoTagValuesParams) ([]s
 
 	var resp tempoTagValuesResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("unmarshalling Tempo tag values response (content: %s): %w", string(body), err)
+		return nil, fmt.Errorf("unmarshalling Tempo tag values response (content: %s): %w", truncateForLog(string(body), 500), err)
 	}
 	return resp.TagValues, nil
 }
@@ -396,6 +396,16 @@ func tempoTimeRange(startRFC3339, endRFC3339 string) (time.Time, time.Time, erro
 		return time.Time{}, time.Time{}, fmt.Errorf("failed to parse end timestamp %q: %w", endRFC3339, err)
 	}
 	return validateTimeRange(start, end)
+}
+
+// truncateForLog bounds a string used in an error message so an unexpected
+// large response body (e.g. an HTML error page, up to tempoResponseLimit) does
+// not flood logs.
+func truncateForLog(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "... (truncated)"
 }
 
 // formatUnixNano converts a Tempo startTimeUnixNano string (nanoseconds since

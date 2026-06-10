@@ -24,6 +24,12 @@ func TestFormatUnixNano(t *testing.T) {
 	assert.Equal(t, "", formatUnixNano("not-a-number"))
 }
 
+func TestTruncateForLog(t *testing.T) {
+	assert.Equal(t, "short", truncateForLog("short", 500))
+	assert.Equal(t, "ab... (truncated)", truncateForLog("abcdef", 2))
+	assert.Equal(t, "abc", truncateForLog("abc", 3)) // exactly at limit, not truncated
+}
+
 func TestTempoTimeRange(t *testing.T) {
 	t.Run("defaults to last hour", func(t *testing.T) {
 		start, end, err := tempoTimeRange("", "")
