@@ -18,6 +18,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -288,28 +289,70 @@ func getTempoTrace(ctx context.Context, args GetTempoTraceParams) (string, error
 }
 
 // tempoTraceToJSON normalizes a trace-by-id response into readable JSON.
-// Grafana Tempo honors Accept: application/json and already returns JSON, but
-// VictoriaTraces ignores it and returns the trace as OTLP protobuf — in which
-// the per-span timings and IDs are binary and unreadable. We decode that to
-// OTLP-JSON so span durations/attributes are usable. If the body is neither
-// JSON nor a decodable OTLP TracesData, it is returned unchanged (no regression).
+// Grafana Tempo honors Accept: application/json and returns JSON, but the
+// Grafana datasource proxy forwards trace-by-id requests to the backend with
+// Accept: application/protobuf, so VictoriaTraces returns OTLP protobuf — in
+// which per-span timings and IDs are binary and unreadable. We decode that to
+// OTLP-JSON so span durations/attributes are usable.
+//
+// VictoriaTraces wraps the trace in a TempoTraceByIDResponse:
+//
+//	TempoTraceByIDResponse { TempoTrace trace = 1; ... }
+//	TempoTrace             { repeated ResourceSpans resourceSpans = 1; }
+//
+// TempoTrace shares the wire format of OTLP TracesData (repeated ResourceSpans
+// at field 1), so we unwrap the outer field-1 message and decode the inner
+// bytes as TracesData. We also try the body as-is (a bare TracesData, e.g.
+// from real Grafana Tempo's protobuf form). If nothing decodes, the body is
+// returned unchanged (no regression).
 func tempoTraceToJSON(body []byte) string {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
 		return string(body)
 	}
-	// Already JSON (Grafana Tempo path).
+	// Already JSON.
 	if trimmed[0] == '{' || trimmed[0] == '[' {
 		return string(body)
 	}
-	// VictoriaTraces path: OTLP protobuf → OTLP-JSON.
-	var td tracepb.TracesData
-	if err := proto.Unmarshal(body, &td); err == nil && len(td.ResourceSpans) > 0 {
-		if js, err := protojson.Marshal(&td); err == nil {
-			return string(js)
+	// Try the unwrapped inner message first (VictoriaTraces TempoTraceByIDResponse),
+	// then the raw body (bare TracesData).
+	for _, candidate := range [][]byte{protoField1Message(body), body} {
+		if candidate == nil {
+			continue
+		}
+		var td tracepb.TracesData
+		if err := proto.Unmarshal(candidate, &td); err == nil && len(td.ResourceSpans) > 0 {
+			if js, err := protojson.Marshal(&td); err == nil {
+				return string(js)
+			}
 		}
 	}
 	return string(body)
+}
+
+// protoField1Message returns the bytes of the first length-delimited field 1
+// in a protobuf message (e.g. TempoTraceByIDResponse.trace), or nil if absent.
+func protoField1Message(b []byte) []byte {
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return nil
+		}
+		b = b[n:]
+		if num == 1 && typ == protowire.BytesType {
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 {
+				return nil
+			}
+			return v
+		}
+		vn := protowire.ConsumeFieldValue(num, typ, b)
+		if vn < 0 {
+			return nil
+		}
+		b = b[vn:]
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
