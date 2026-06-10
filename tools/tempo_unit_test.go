@@ -11,6 +11,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestFormatUnixNano(t *testing.T) {
@@ -40,6 +44,50 @@ func TestUnixNanoUnmarshal(t *testing.T) {
 
 	var u unixNano
 	require.Error(t, json.Unmarshal([]byte(`"not-a-number"`), &u))
+}
+
+func TestTempoTraceToJSON(t *testing.T) {
+	t.Run("decodes OTLP protobuf to JSON", func(t *testing.T) {
+		// VictoriaTraces returns the trace as an OTLP TracesData protobuf.
+		td := &tracepb.TracesData{
+			ResourceSpans: []*tracepb.ResourceSpans{{
+				Resource: &resourcepb.Resource{
+					Attributes: []*commonpb.KeyValue{{
+						Key:   "service.name",
+						Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "mcp-services"}},
+					}},
+				},
+				ScopeSpans: []*tracepb.ScopeSpans{{
+					Spans: []*tracepb.Span{{
+						Name:              "HAProxy session",
+						StartTimeUnixNano: 1781093909969693262,
+						EndTimeUnixNano:   1781093909973618956,
+					}},
+				}},
+			}},
+		}
+		raw, err := proto.Marshal(td)
+		require.NoError(t, err)
+		require.NotEqual(t, '{', raw[0], "protobuf must not look like JSON")
+
+		out := tempoTraceToJSON(raw)
+		// Must now be readable JSON with the span name, service, and timings.
+		var decoded map[string]any
+		require.NoError(t, json.Unmarshal([]byte(out), &decoded), "output should be JSON: %s", out)
+		assert.Contains(t, out, "mcp-services")
+		assert.Contains(t, out, "HAProxy session")
+		assert.Contains(t, out, "1781093909969693262") // startTimeUnixNano survives as a string
+	})
+
+	t.Run("passes JSON through unchanged", func(t *testing.T) {
+		js := `{"trace":{"resourceSpans":[]}}`
+		assert.Equal(t, js, tempoTraceToJSON([]byte(js)))
+	})
+
+	t.Run("returns non-decodable body unchanged", func(t *testing.T) {
+		raw := []byte("not protobuf, not json")
+		assert.Equal(t, string(raw), tempoTraceToJSON(raw))
+	})
 }
 
 func TestTruncateForLog(t *testing.T) {

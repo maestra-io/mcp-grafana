@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,9 @@ import (
 	mcpgrafana "github.com/grafana/mcp-grafana"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // DefaultTempoSearchLimit is the default number of traces returned by a
@@ -234,8 +238,10 @@ func queryTempoTraces(ctx context.Context, args QueryTempoTracesParams) ([]Tempo
 
 const getTempoTraceToolPrompt = `
 Fetches a single trace by its trace ID from a Tempo (or VictoriaTraces Tempo-compatible) datasource.
-Returns the trace in OTLP-JSON format (resource spans with their attributes, status, and timing).
-Discover trace IDs first with query_tempo_traces. If the time range is not provided, it defaults to the last hour.
+Returns the trace as OTLP-JSON — resource spans with their attributes, status, and per-span timing
+(startTimeUnixNano / endTimeUnixNano in nanoseconds). VictoriaTraces' protobuf response is decoded to
+JSON automatically. Discover trace IDs first with query_tempo_traces. If the time range is not provided,
+it defaults to the last hour.
 `
 
 var GetTempoTrace = mcpgrafana.MustTool(
@@ -278,7 +284,32 @@ func getTempoTrace(ctx context.Context, args GetTempoTraceParams) (string, error
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch Tempo trace: %w", err)
 	}
-	return string(body), nil
+	return tempoTraceToJSON(body), nil
+}
+
+// tempoTraceToJSON normalizes a trace-by-id response into readable JSON.
+// Grafana Tempo honors Accept: application/json and already returns JSON, but
+// VictoriaTraces ignores it and returns the trace as OTLP protobuf — in which
+// the per-span timings and IDs are binary and unreadable. We decode that to
+// OTLP-JSON so span durations/attributes are usable. If the body is neither
+// JSON nor a decodable OTLP TracesData, it is returned unchanged (no regression).
+func tempoTraceToJSON(body []byte) string {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return string(body)
+	}
+	// Already JSON (Grafana Tempo path).
+	if trimmed[0] == '{' || trimmed[0] == '[' {
+		return string(body)
+	}
+	// VictoriaTraces path: OTLP protobuf → OTLP-JSON.
+	var td tracepb.TracesData
+	if err := proto.Unmarshal(body, &td); err == nil && len(td.ResourceSpans) > 0 {
+		if js, err := protojson.Marshal(&td); err == nil {
+			return string(js)
+		}
+	}
+	return string(body)
 }
 
 // ---------------------------------------------------------------------------
