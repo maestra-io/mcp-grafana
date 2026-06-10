@@ -319,6 +319,10 @@ Scopes define the specific resources that permissions apply to. Each action requ
 | `list_pyroscope_label_values`     | Pyroscope   | List label values matching a selector for a label name              | `datasources:query`                     | `datasources:uid:pyroscope-uid`                     |
 | `list_pyroscope_profile_types`    | Pyroscope   | List available profile types                                        | `datasources:query`                     | `datasources:uid:pyroscope-uid`                     |
 | `fetch_pyroscope_profile`         | Pyroscope   | Fetches a profile in DOT format for analysis                        | `datasources:query`                     | `datasources:uid:pyroscope-uid`                     |
+| `query_tempo_traces`              | Tempo       | Search traces with a TraceQL query                                  | `datasources:query`                     | `datasources:uid:tempo-uid`                         |
+| `get_tempo_trace`                 | Tempo       | Fetch a full trace by its trace ID                                  | `datasources:query`                     | `datasources:uid:tempo-uid`                         |
+| `list_tempo_tag_names`            | Tempo       | List searchable trace tag (attribute) names                         | `datasources:query`                     | `datasources:uid:tempo-uid`                         |
+| `list_tempo_tag_values`           | Tempo       | List values for a given trace tag (attribute)                       | `datasources:query`                     | `datasources:uid:tempo-uid`                         |
 | `get_assertions`                  | Asserts     | Get assertion summary for a given entity                            | Plugin-specific permissions             | Plugin-specific scopes                              |
 | `generate_deeplink`               | Navigation  | Generate accurate deeplink URLs for Grafana resources               | None (read-only URL generation)         | N/A                                                 |
 | `get_annotations`                 | Annotations | Fetch annotations with filters                                      | `annotations:read`                      | `annotations:*` or `annotations:id:123`             |
@@ -368,6 +372,7 @@ The `mcp-grafana` binary supports various command-line flags for configuration:
 - `--disable-sift`: Disable sift tools
 - `--disable-admin`: Disable admin tools
 - `--disable-pyroscope`: Disable pyroscope tools
+- `--disable-tempo`: Disable tempo tools
 - `--disable-navigation`: Disable navigation tools
 - `--disable-rendering`: Disable rendering tools (panel/dashboard image export)
 - `--disable-cloudwatch`: Disable CloudWatch tools
