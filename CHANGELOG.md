@@ -10,10 +10,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `update_dashboard` now writes v2 (Kubernetes-schema) dashboards through Grafana's apiserver, preserving `AutoGridLayout` / `conditionalRendering` fields the legacy `/api/dashboards/db` endpoint silently down-converts. Detection is automatic on the top-level `apiVersion` (`dashboard.grafana.app/<ver>`). Namespace defaults to `default`; override via the `GRAFANA_DASHBOARD_NAMESPACE` env var for Grafana Cloud (`stacks-<id>`) or multi-org OSS (`org-<N>`). `overwrite` is honored (an existing dashboard with `overwrite=false` is not replaced); `message`/`userId` are legacy-only and ignored for v2.
+- Native Tempo trace-query tools (`query_tempo_traces`, `get_tempo_trace`, `list_tempo_tag_names`, `list_tempo_tag_values`) for Grafana Tempo and VictoriaTraces (`/select/tempo`) datasources. The v2 Tempo API is used; `get_tempo_trace` decodes VictoriaTraces' protobuf `TempoTraceByIDResponse` into OTLP-JSON.
+- Optional `startRfc3339`/`endRfc3339` time range parameters for `list_prometheus_metric_names` to restrict results to metrics active within a window
 
 ### Fixed
 
 - `oncall.get_alert_group` no longer silently drops `acknowledged_by`, `resolved_by`, `silenced_at`, and `last_alert` fields. The upstream amixr-api-go-client `AlertGroup` struct only declares the 10 list-shape fields, so unmarshaling the detail-endpoint response through that struct truncated the response. The wrapper now decodes into a local `DetailedAlertGroup` struct and calls the API directly, mirroring the pattern already used by `alertGroupAction`.
+
+## [0.15.2] - 2026-06-04
+
+### Fixed
+
+- Docker images are again published to `docker.io/grafana/mcp-grafana`. v0.15.0 and v0.15.1 Docker images were never published because the shared Docker Hub credential was restricted to read-only. The release workflow now publishes via Grafana's GAR-based Docker Hub mirror pipeline ([#925](https://github.com/grafana/mcp-grafana/pull/925))
+
+## [0.15.1] - 2026-06-03
+
+### Added
+
+- `shorten_url` tool for creating Grafana short links from long dashboard or explore URLs ([#899](https://github.com/grafana/mcp-grafana/pull/899))
+- Provisioning workflow tools: `list_provisioning_repositories` for discovering connected repositories, `validate_provisioning_file` for dry-run validation of provisioning files, and provisioning preview support in `get_panel_image` and `generate_deeplink` for rendering dashboards from PR branches before merge ([#900](https://github.com/grafana/mcp-grafana/pull/900))
+
+### Changed
+
+- Rendering tools now use a shared transport chain with `BaseTransport` support for consistent HTTP middleware ([#918](https://github.com/grafana/mcp-grafana/pull/918))
+
+### Security
+
+- Redact credentials from debug transport logs to prevent accidental exposure ([#920](https://github.com/grafana/mcp-grafana/pull/920))
+- Update Go to 1.26.3 to fix CVE-2026-33810 and bump litellm dependency ([#916](https://github.com/grafana/mcp-grafana/pull/916))
+
+## [0.15.0] - 2026-06-01
+
+### Added
+
+- Snowflake datasource tools for querying Snowflake through Grafana's `/api/ds/query` endpoint with macro substitution and template variables ([#845](https://github.com/grafana/mcp-grafana/pull/845))
+- Amazon Athena datasource support with schema discovery tools and SQL query execution, including macro substitution and result reuse ([#799](https://github.com/grafana/mcp-grafana/pull/799))
+- VictoriaLogs support through existing Loki tools, routing LogsQL queries via the VictoriaLogs HTTP API without adding new tools ([#850](https://github.com/grafana/mcp-grafana/pull/850))
+- Loki label-strategy analyzer tools for evaluating label cardinality and optimization opportunities ([#885](https://github.com/grafana/mcp-grafana/pull/885))
+- Plugin install and search tools for discovering, inspecting, and installing Grafana plugins ([#835](https://github.com/grafana/mcp-grafana/pull/835))
+
+### Fixed
+
+- Scope datasource fallback cache by request path to prevent incorrect cache hits across different API endpoints ([#897](https://github.com/grafana/mcp-grafana/pull/897))
+- Release builds now report the correct version via ldflags injection ([#895](https://github.com/grafana/mcp-grafana/pull/895))
+- Improved Loki and dashboard tool descriptions for better agent accuracy ([#880](https://github.com/grafana/mcp-grafana/pull/880))
+- Add readResponseBody helper to limit and detect oversized responses, preventing excessive memory use ([#884](https://github.com/grafana/mcp-grafana/pull/884))
+- Improved timeout error messages for proxied tools with context-aware logging ([#881](https://github.com/grafana/mcp-grafana/pull/881))
+- Cap error response body reads to 1KB across all HTTP clients to prevent excessive memory allocation from misbehaving servers ([#876](https://github.com/grafana/mcp-grafana/pull/876))
+
+### Changed
+
+- Consolidated duplicated `/api/ds/query` implementations into a shared helper ([#877](https://github.com/grafana/mcp-grafana/pull/877))
+
+### Security
+
+- Update `golang.org/x/net` to v0.55.0 to address security vulnerability ([#901](https://github.com/grafana/mcp-grafana/pull/901))
+
+## [0.14.0] - 2026-05-08
+
+### Added
+
+- Generic API request tool for making arbitrary HTTP requests to the Grafana API ([#841](https://github.com/grafana/mcp-grafana/pull/841))
+- OpenSearch datasource support ([#669](https://github.com/grafana/mcp-grafana/pull/669))
+- Tool to retrieve Grafana plugin information ([#826](https://github.com/grafana/mcp-grafana/pull/826))
+- Export logs via OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set, consistent with existing OTLP trace export ([#839](https://github.com/grafana/mcp-grafana/pull/839))
+- Configurable slow-request-threshold logging for identifying long-running tool calls ([#756](https://github.com/grafana/mcp-grafana/pull/756))
+- Server instructions now dynamically reflect only the enabled tool categories, preventing agents from attempting to use disabled tools ([#829](https://github.com/grafana/mcp-grafana/pull/829))
+
+### Fixed
+
+- Route OnCall tools through IRM plugin proxy for correct on-behalf-of authentication ([#842](https://github.com/grafana/mcp-grafana/pull/842))
+- Propagate context to jq operations and return clear errors on non-JSON input ([#847](https://github.com/grafana/mcp-grafana/pull/847))
+- Prevent panic in Sift tool when pattern type assertion fails ([#834](https://github.com/grafana/mcp-grafana/pull/834))
 
 ## [0.13.1] - 2026-04-30
 
@@ -212,6 +280,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Upgrade Docker base image packages to resolve critical OpenSSL CVE-2025-15467 (CVSS 9.8) ([#551](https://github.com/grafana/mcp-grafana/pull/551))
 
+[0.15.2]: https://github.com/grafana/mcp-grafana/compare/v0.15.1...v0.15.2
+[0.15.1]: https://github.com/grafana/mcp-grafana/compare/v0.15.0...v0.15.1
+[0.15.0]: https://github.com/grafana/mcp-grafana/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/grafana/mcp-grafana/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/grafana/mcp-grafana/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/grafana/mcp-grafana/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/grafana/mcp-grafana/compare/v0.12.0...v0.12.1
