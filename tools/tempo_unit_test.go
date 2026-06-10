@@ -16,12 +16,30 @@ import (
 func TestFormatUnixNano(t *testing.T) {
 	// 2025-01-01T00:00:00Z in nanoseconds.
 	want := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
-	assert.Equal(t, want.Format(time.RFC3339), formatUnixNano("1735689600000000000"))
+	assert.Equal(t, want.Format(time.RFC3339), formatUnixNano(1735689600000000000))
 
-	assert.Equal(t, "", formatUnixNano(""))
-	assert.Equal(t, "", formatUnixNano("   "))
-	assert.Equal(t, "", formatUnixNano("0"))
-	assert.Equal(t, "", formatUnixNano("not-a-number"))
+	assert.Equal(t, "", formatUnixNano(0))
+	assert.Equal(t, "", formatUnixNano(-5))
+}
+
+func TestUnixNanoUnmarshal(t *testing.T) {
+	// VictoriaTraces encodes startTimeUnixNano as a bare JSON number;
+	// Grafana Tempo (and VictoriaTraces inside spanSets) as a quoted string.
+	cases := map[string]int64{
+		`1735689600000000000`:   1735689600000000000,
+		`"1735689600000000000"`: 1735689600000000000,
+		`0`:                     0,
+		`""`:                    0,
+		`null`:                  0,
+	}
+	for in, want := range cases {
+		var u unixNano
+		require.NoError(t, json.Unmarshal([]byte(in), &u), "input %s", in)
+		assert.Equal(t, want, int64(u), "input %s", in)
+	}
+
+	var u unixNano
+	require.Error(t, json.Unmarshal([]byte(`"not-a-number"`), &u))
 }
 
 func TestTruncateForLog(t *testing.T) {
@@ -63,7 +81,7 @@ func TestTempoSearchResponseParsing(t *testing.T) {
 				"traceID": "abc123",
 				"rootServiceName": "mcp",
 				"rootTraceName": "POST /mcp",
-				"startTimeUnixNano": "1735689600000000000",
+				"startTimeUnixNano": 1735689600000000000,
 				"durationMs": 205
 			},
 			{
@@ -83,22 +101,37 @@ func TestTempoSearchResponseParsing(t *testing.T) {
 	assert.Equal(t, "mcp", first.RootServiceName)
 	assert.Equal(t, "POST /mcp", first.RootTraceName)
 	assert.Equal(t, int64(205), first.DurationMs)
-	assert.Equal(t, "2025-01-01T00:00:00Z", formatUnixNano(first.StartTimeUnixNano))
+	assert.Equal(t, "2025-01-01T00:00:00Z", formatUnixNano(int64(first.StartTimeUnixNano)))
 
 	second := resp.Traces[1]
 	assert.Equal(t, "def456", second.TraceID)
 	assert.Empty(t, second.RootTraceName)
-	assert.Equal(t, "", formatUnixNano(second.StartTimeUnixNano))
+	assert.Equal(t, "", formatUnixNano(int64(second.StartTimeUnixNano)))
 }
 
-func TestTempoTagResponseParsing(t *testing.T) {
+func TestTempoTagNamesV2Parsing(t *testing.T) {
+	// /api/v2/search/tags groups tags under scopes (resource, span, intrinsic).
 	var names tempoTagNamesResponse
-	require.NoError(t, json.Unmarshal([]byte(`{"tagNames":["service.name","http.status_code"]}`), &names))
-	assert.Equal(t, []string{"service.name", "http.status_code"}, names.TagNames)
+	raw := `{"scopes":[
+		{"name":"resource","tags":["service.name","k8s.namespace.name"]},
+		{"name":"span","tags":["http.status_code"]},
+		{"name":"intrinsic","tags":["name","status"]}
+	]}`
+	require.NoError(t, json.Unmarshal([]byte(raw), &names))
+	require.Len(t, names.Scopes, 3)
+	assert.Equal(t, "resource", names.Scopes[0].Name)
+	assert.Equal(t, []string{"service.name", "k8s.namespace.name"}, names.Scopes[0].Tags)
+	assert.Equal(t, []string{"name", "status"}, names.Scopes[2].Tags)
+}
 
+func TestTempoTagValuesV2Parsing(t *testing.T) {
+	// /api/v2/search/tag/<tag>/values returns typed value objects.
 	var values tempoTagValuesResponse
-	require.NoError(t, json.Unmarshal([]byte(`{"tagValues":["mcp","haproxy"]}`), &values))
-	assert.Equal(t, []string{"mcp", "haproxy"}, values.TagValues)
+	require.NoError(t, json.Unmarshal([]byte(`{"tagValues":[{"type":"string","value":"mcp"},{"type":"string","value":"haproxy"}]}`), &values))
+	require.Len(t, values.TagValues, 2)
+	assert.Equal(t, "mcp", values.TagValues[0].Value)
+	assert.Equal(t, "string", values.TagValues[0].Type)
+	assert.Equal(t, "haproxy", values.TagValues[1].Value)
 }
 
 // TestTempoClientGet exercises the HTTP layer of the Tempo client against a
@@ -116,7 +149,7 @@ func TestTempoClientGet(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"tagNames":["service.name"]}`))
+		_, _ = w.Write([]byte(`{"scopes":[{"name":"resource","tags":["service.name"]}]}`))
 	}))
 	defer srv.Close()
 
@@ -125,15 +158,16 @@ func TestTempoClientGet(t *testing.T) {
 	t.Run("happy path", func(t *testing.T) {
 		params := url.Values{}
 		params.Set("start", "100")
-		body, err := client.get(context.Background(), "/api/search/tags", params)
+		body, err := client.get(context.Background(), "/api/v2/search/tags", params)
 		require.NoError(t, err)
-		assert.Equal(t, "/api/search/tags", gotPath)
+		assert.Equal(t, "/api/v2/search/tags", gotPath)
 		assert.Equal(t, "application/json", gotAccept)
 		assert.Equal(t, "start=100", gotQuery)
 
 		var resp tempoTagNamesResponse
 		require.NoError(t, json.Unmarshal(body, &resp))
-		assert.Equal(t, []string{"service.name"}, resp.TagNames)
+		require.Len(t, resp.Scopes, 1)
+		assert.Equal(t, []string{"service.name"}, resp.Scopes[0].Tags)
 	})
 
 	t.Run("non-200 surfaces status and body", func(t *testing.T) {

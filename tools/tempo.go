@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -144,11 +145,31 @@ type tempoSearchResponse struct {
 }
 
 type tempoTraceSummaryRaw struct {
-	TraceID           string `json:"traceID"`
-	RootServiceName   string `json:"rootServiceName"`
-	RootTraceName     string `json:"rootTraceName"`
-	StartTimeUnixNano string `json:"startTimeUnixNano"`
-	DurationMs        int64  `json:"durationMs"`
+	TraceID           string   `json:"traceID"`
+	RootServiceName   string   `json:"rootServiceName"`
+	RootTraceName     string   `json:"rootTraceName"`
+	StartTimeUnixNano unixNano `json:"startTimeUnixNano"`
+	DurationMs        int64    `json:"durationMs"`
+}
+
+// unixNano is a nanosecond Unix timestamp that tolerates being encoded as
+// either a JSON number or a JSON string. Grafana Tempo returns it as a string,
+// while VictoriaTraces returns it as a number at the trace-summary level (and
+// as a string inside spanSets) — so we must accept both.
+type unixNano int64
+
+func (u *unixNano) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
+	if s == "" || s == "null" {
+		*u = 0
+		return nil
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid unix-nano timestamp %q: %w", s, err)
+	}
+	*u = unixNano(n)
+	return nil
 }
 
 // TempoTraceSummary is the cleaned-up trace summary returned to the caller.
@@ -200,7 +221,7 @@ func queryTempoTraces(ctx context.Context, args QueryTempoTracesParams) ([]Tempo
 			TraceID:         t.TraceID,
 			RootServiceName: t.RootServiceName,
 			RootTraceName:   t.RootTraceName,
-			StartTime:       formatUnixNano(t.StartTimeUnixNano),
+			StartTime:       formatUnixNano(int64(t.StartTimeUnixNano)),
 			DurationMs:      t.DurationMs,
 		})
 	}
@@ -253,7 +274,7 @@ func getTempoTrace(ctx context.Context, args GetTempoTraceParams) (string, error
 	params.Set("start", strconv.FormatInt(start.Unix(), 10))
 	params.Set("end", strconv.FormatInt(end.Unix(), 10))
 
-	body, err := client.get(ctx, "/api/traces/"+url.PathEscape(traceID), params)
+	body, err := client.get(ctx, "/api/v2/traces/"+url.PathEscape(traceID), params)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch Tempo trace: %w", err)
 	}
@@ -285,9 +306,13 @@ type ListTempoTagNamesParams struct {
 	EndRFC3339    string `json:"end_rfc_3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format (defaults to now)"`
 }
 
-// tempoTagNamesResponse is the relevant subset of Tempo's /api/search/tags response.
+// tempoTagNamesResponse is the relevant subset of Tempo's /api/v2/search/tags
+// response. Tags are grouped under scopes (resource, span, intrinsic).
 type tempoTagNamesResponse struct {
-	TagNames []string `json:"tagNames"`
+	Scopes []struct {
+		Name string   `json:"name"`
+		Tags []string `json:"tags"`
+	} `json:"scopes"`
 }
 
 func listTempoTagNames(ctx context.Context, args ListTempoTagNamesParams) ([]string, error) {
@@ -305,7 +330,7 @@ func listTempoTagNames(ctx context.Context, args ListTempoTagNamesParams) ([]str
 	params.Set("start", strconv.FormatInt(start.Unix(), 10))
 	params.Set("end", strconv.FormatInt(end.Unix(), 10))
 
-	body, err := client.get(ctx, "/api/search/tags", params)
+	body, err := client.get(ctx, "/api/v2/search/tags", params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list Tempo tag names: %w", err)
 	}
@@ -314,7 +339,21 @@ func listTempoTagNames(ctx context.Context, args ListTempoTagNamesParams) ([]str
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("unmarshalling Tempo tag names response (content: %s): %w", truncateForLog(string(body), 500), err)
 	}
-	return resp.TagNames, nil
+
+	// Flatten scopes into a single deduplicated, sorted list of tag names.
+	seen := make(map[string]struct{})
+	names := make([]string, 0)
+	for _, scope := range resp.Scopes {
+		for _, tag := range scope.Tags {
+			if _, ok := seen[tag]; ok {
+				continue
+			}
+			seen[tag] = struct{}{}
+			names = append(names, tag)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -338,14 +377,18 @@ var ListTempoTagValues = mcpgrafana.MustTool(
 
 type ListTempoTagValuesParams struct {
 	DataSourceUID string `json:"data_source_uid" jsonschema:"required,description=The UID of the Tempo datasource to query"`
-	Tag           string `json:"tag" jsonschema:"required,description=The tag (attribute) name to list values for\\, e.g. 'service.name'"`
+	Tag           string `json:"tag" jsonschema:"required,description=The tag (attribute) name to list values for. Use a TraceQL-scoped identifier\\, e.g. 'resource.service.name'\\, 'span.http.status_code'\\, or an intrinsic like 'name' or 'status'"`
 	StartRFC3339  string `json:"start_rfc_3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format (defaults to 1 hour ago)"`
 	EndRFC3339    string `json:"end_rfc_3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format (defaults to now)"`
 }
 
-// tempoTagValuesResponse is the relevant subset of Tempo's /api/search/tag/<tag>/values response.
+// tempoTagValuesResponse is the relevant subset of Tempo's
+// /api/v2/search/tag/<tag>/values response. Each value carries its type.
 type tempoTagValuesResponse struct {
-	TagValues []string `json:"tagValues"`
+	TagValues []struct {
+		Type  string `json:"type"`
+		Value string `json:"value"`
+	} `json:"tagValues"`
 }
 
 func listTempoTagValues(ctx context.Context, args ListTempoTagValuesParams) ([]string, error) {
@@ -368,7 +411,7 @@ func listTempoTagValues(ctx context.Context, args ListTempoTagValuesParams) ([]s
 	params.Set("start", strconv.FormatInt(start.Unix(), 10))
 	params.Set("end", strconv.FormatInt(end.Unix(), 10))
 
-	body, err := client.get(ctx, "/api/search/tag/"+url.PathEscape(tag)+"/values", params)
+	body, err := client.get(ctx, "/api/v2/search/tag/"+url.PathEscape(tag)+"/values", params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list Tempo tag values: %w", err)
 	}
@@ -377,7 +420,12 @@ func listTempoTagValues(ctx context.Context, args ListTempoTagValuesParams) ([]s
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("unmarshalling Tempo tag values response (content: %s): %w", truncateForLog(string(body), 500), err)
 	}
-	return resp.TagValues, nil
+
+	values := make([]string, 0, len(resp.TagValues))
+	for _, v := range resp.TagValues {
+		values = append(values, v.Value)
+	}
+	return values, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -408,15 +456,10 @@ func truncateForLog(s string, maxLen int) string {
 	return s[:maxLen] + "... (truncated)"
 }
 
-// formatUnixNano converts a Tempo startTimeUnixNano string (nanoseconds since
-// the Unix epoch) into an RFC3339 timestamp. Returns "" if it can't parse.
-func formatUnixNano(nanos string) string {
-	nanos = strings.TrimSpace(nanos)
-	if nanos == "" {
-		return ""
-	}
-	n, err := strconv.ParseInt(nanos, 10, 64)
-	if err != nil || n <= 0 {
+// formatUnixNano converts a nanoseconds-since-Unix-epoch timestamp into an
+// RFC3339 string. Returns "" for non-positive values.
+func formatUnixNano(n int64) string {
+	if n <= 0 {
 		return ""
 	}
 	return time.Unix(0, n).UTC().Format(time.RFC3339)
