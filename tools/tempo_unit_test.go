@@ -14,8 +14,44 @@ import (
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
+
+// sampleTracesData builds a minimal OTLP TracesData protobuf with one
+// mcp-services span (the wire format VictoriaTraces' TempoTrace shares).
+func sampleTracesData(t *testing.T) []byte {
+	t.Helper()
+	td := &tracepb.TracesData{
+		ResourceSpans: []*tracepb.ResourceSpans{{
+			Resource: &resourcepb.Resource{
+				Attributes: []*commonpb.KeyValue{{
+					Key:   "service.name",
+					Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "mcp-services"}},
+				}},
+			},
+			ScopeSpans: []*tracepb.ScopeSpans{{
+				Spans: []*tracepb.Span{{
+					Name:              "HAProxy session",
+					StartTimeUnixNano: 1781093909969693262,
+					EndTimeUnixNano:   1781093909973618956,
+				}},
+			}},
+		}},
+	}
+	raw, err := proto.Marshal(td)
+	require.NoError(t, err)
+	return raw
+}
+
+func assertDecodedTraceJSON(t *testing.T, out string) {
+	t.Helper()
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal([]byte(out), &decoded), "output should be JSON: %s", out)
+	assert.Contains(t, out, "mcp-services")
+	assert.Contains(t, out, "HAProxy session")
+	assert.Contains(t, out, "1781093909969693262") // startTimeUnixNano survives as a string
+}
 
 func TestFormatUnixNano(t *testing.T) {
 	// 2025-01-01T00:00:00Z in nanoseconds.
@@ -47,36 +83,21 @@ func TestUnixNanoUnmarshal(t *testing.T) {
 }
 
 func TestTempoTraceToJSON(t *testing.T) {
-	t.Run("decodes OTLP protobuf to JSON", func(t *testing.T) {
-		// VictoriaTraces returns the trace as an OTLP TracesData protobuf.
-		td := &tracepb.TracesData{
-			ResourceSpans: []*tracepb.ResourceSpans{{
-				Resource: &resourcepb.Resource{
-					Attributes: []*commonpb.KeyValue{{
-						Key:   "service.name",
-						Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "mcp-services"}},
-					}},
-				},
-				ScopeSpans: []*tracepb.ScopeSpans{{
-					Spans: []*tracepb.Span{{
-						Name:              "HAProxy session",
-						StartTimeUnixNano: 1781093909969693262,
-						EndTimeUnixNano:   1781093909973618956,
-					}},
-				}},
-			}},
-		}
-		raw, err := proto.Marshal(td)
-		require.NoError(t, err)
+	t.Run("decodes bare OTLP TracesData protobuf to JSON", func(t *testing.T) {
+		raw := sampleTracesData(t)
 		require.NotEqual(t, '{', raw[0], "protobuf must not look like JSON")
+		assertDecodedTraceJSON(t, tempoTraceToJSON(raw))
+	})
 
-		out := tempoTraceToJSON(raw)
-		// Must now be readable JSON with the span name, service, and timings.
-		var decoded map[string]any
-		require.NoError(t, json.Unmarshal([]byte(out), &decoded), "output should be JSON: %s", out)
-		assert.Contains(t, out, "mcp-services")
-		assert.Contains(t, out, "HAProxy session")
-		assert.Contains(t, out, "1781093909969693262") // startTimeUnixNano survives as a string
+	t.Run("decodes wrapped VictoriaTraces TempoTraceByIDResponse to JSON", func(t *testing.T) {
+		// VictoriaTraces wraps the trace: TempoTraceByIDResponse{ trace(field 1) = TempoTrace }.
+		// TempoTrace shares TracesData's wire format, so wrapping the TracesData
+		// bytes as a length-delimited field 1 reproduces the real backend response.
+		inner := sampleTracesData(t)
+		var wrapped []byte
+		wrapped = protowire.AppendTag(wrapped, 1, protowire.BytesType)
+		wrapped = protowire.AppendBytes(wrapped, inner)
+		assertDecodedTraceJSON(t, tempoTraceToJSON(wrapped))
 	})
 
 	t.Run("passes JSON through unchanged", func(t *testing.T) {
