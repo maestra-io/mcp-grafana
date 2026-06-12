@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- ClickHouse tools (`query_clickhouse`, `list_clickhouse_tables`, `describe_clickhouse_table`) are now in the default `enabled-tools` list, so ClickHouse datasources are queryable without passing a custom flag. Opt out with `--disable-clickhouse`.
+
 ### Added
 
 - `update_dashboard` now writes v2 (Kubernetes-schema) dashboards through Grafana's apiserver, preserving `AutoGridLayout` / `conditionalRendering` fields the legacy `/api/dashboards/db` endpoint silently down-converts. Detection is automatic on the top-level `apiVersion` (`dashboard.grafana.app/<ver>`). Namespace defaults to `default`; override via the `GRAFANA_DASHBOARD_NAMESPACE` env var for Grafana Cloud (`stacks-<id>`) or multi-org OSS (`org-<N>`). `overwrite` is honored (an existing dashboard with `overwrite=false` is not replaced); `message`/`userId` are legacy-only and ignored for v2.
