@@ -147,22 +147,48 @@ func TestVictoriaLogsBackend_QueryLogs_ForwardReversesOrder(t *testing.T) {
 	assert.Equal(t, "newest", res.Entries[2].Line)
 }
 
-func TestVictoriaLogsBackend_QueryLogs_InstantCollapsesWindow(t *testing.T) {
+// Regression: an "instant" query used to collapse the window to start==end.
+// VictoriaLogs evaluates over [start, end], so an empty range matches nothing
+// and every instant query silently returned zero rows — indistinguishable from
+// a true negative. The caller's window must reach VictoriaLogs intact.
+func TestVictoriaLogsBackend_QueryLogs_InstantPreservesWindow(t *testing.T) {
 	fake := newFakeVLServer(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "")
 	})
 	b := newTestVLBackend(t, fake.server)
 
+	start := time.Date(2026, 5, 10, 11, 55, 0, 0, time.UTC)
 	end := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
 	_, err := b.QueryLogs(context.Background(), lokiQueryParams{
-		Query:     "*",
+		Query:     "* | stats count() as n",
 		QueryType: "instant",
+		Start:     start,
 		End:       end,
 		Limit:     1,
 	})
 	require.NoError(t, err)
-	assert.Equal(t, end.Format(time.RFC3339), fake.lastForm.Get("start"))
+	assert.Equal(t, start.Format(time.RFC3339), fake.lastForm.Get("start"))
 	assert.Equal(t, end.Format(time.RFC3339), fake.lastForm.Get("end"))
+	assert.NotEqual(t, fake.lastForm.Get("start"), fake.lastForm.Get("end"),
+		"instant must not collapse the window: start==end matches nothing in VictoriaLogs")
+}
+
+// An instant query with no explicit window must still not send start==end.
+func TestVictoriaLogsBackend_QueryLogs_InstantWithoutWindowSendsNoEmptyRange(t *testing.T) {
+	fake := newFakeVLServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "")
+	})
+	b := newTestVLBackend(t, fake.server)
+
+	_, err := b.QueryLogs(context.Background(), lokiQueryParams{
+		Query:     "*",
+		QueryType: "instant",
+		Limit:     1,
+	})
+	require.NoError(t, err)
+	gotStart, gotEnd := fake.lastForm.Get("start"), fake.lastForm.Get("end")
+	assert.Empty(t, gotStart, "no start supplied, none should be sent")
+	assert.Empty(t, gotEnd, "no end supplied, none should be sent")
 }
 
 func TestVictoriaLogsBackend_QueryStats_AppendsCountPipe(t *testing.T) {

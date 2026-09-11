@@ -177,8 +177,9 @@ func (b *victoriaLogsBackend) ListLabelValues(ctx context.Context, labelName str
 }
 
 // QueryLogs runs a LogsQL query. Range and instant requests both go through
-// /select/logsql/query; instant is implemented by anchoring the time window
-// to the requested point. Metric-style queries (PromQL-compatible result
+// /select/logsql/query over the caller's full time window; VictoriaLogs
+// returns one row per `| stats` pipe, so instant needs no special casing.
+// Metric-style queries (PromQL-compatible result
 // types from /stats_query) are not exposed here — callers that want
 // aggregations should phrase them as LogsQL `... | stats by (...)` and use
 // the vector returned by the regular log query.
@@ -187,23 +188,14 @@ func (b *victoriaLogsBackend) QueryLogs(ctx context.Context, p lokiQueryParams) 
 		return nil, fmt.Errorf("invalid query type: %s", p.QueryType)
 	}
 
+	// NOTE: "instant" does NOT collapse the window here. VictoriaLogs
+	// evaluates over [start, end], so start==end is an empty range that
+	// matches nothing — a `| stats count()` then returns 0 and a log query
+	// returns no lines, both indistinguishable from a true negative. A
+	// LogsQL `| stats` pipe already yields a single row for the whole
+	// window, which is what an instant query wants, so the caller's range
+	// is passed through unchanged for both query types.
 	start, end := p.Start, p.End
-	if p.QueryType == "instant" {
-		// Instant ≈ "value at a point in time". VictoriaLogs has no
-		// dedicated instant endpoint, so we collapse the window to the
-		// chosen instant (preferring End, then Start, then now) and let
-		// the limit cap the result.
-		var anchor time.Time
-		switch {
-		case !end.IsZero():
-			anchor = end
-		case !start.IsZero():
-			anchor = start
-		default:
-			anchor = time.Now()
-		}
-		start, end = anchor, anchor
-	}
 
 	params := url.Values{}
 	params.Set("query", p.Query)

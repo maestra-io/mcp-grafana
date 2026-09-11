@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `query_loki_logs` with `queryType='instant'` on a VictoriaLogs datasource (`victoriametrics-logs-datasource`) returned zero rows for every query. The backend collapsed the window to `start == end`, and VictoriaLogs evaluates over `[start, end]`, so the empty range matched nothing: a `| stats count()` pipe returned `0` and a log query returned no lines, both indistinguishable from a true negative — and the tool then emitted a "No logs were ingested during the specified time range" hint naming a window it never queried. The caller's window is now passed through unchanged for both query types; a LogsQL `| stats` pipe already yields a single row per window, so instant needs no special casing. Loki datasources were unaffected.
+- `query_loki_logs` / `query_loki_stats` descriptions recommended `count_over_time()` for exact line counts without noting it is LogQL only; VictoriaLogs rejects it with HTTP 400. They now name the `| stats count()` equivalent.
+
 - `oncall.get_alert_group` no longer silently drops `acknowledged_by`, `resolved_by`, `silenced_at`, and `last_alert` fields. The upstream amixr-api-go-client `AlertGroup` struct only declares the 10 list-shape fields, so unmarshaling the detail-endpoint response through that struct truncated the response. The wrapper now decodes into a local `DetailedAlertGroup` struct and calls the API directly, mirroring the pattern already used by `alertGroupAction`.
 
 ## [0.15.2] - 2026-06-04
