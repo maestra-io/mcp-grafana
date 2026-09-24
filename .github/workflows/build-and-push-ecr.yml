@@ -90,7 +90,7 @@ jobs:
       - name: Build and push
         run: |
           TAG=${{ steps.release-number.outputs.release-number }}
-          docker build -t ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG .
+          docker build --label org.opencontainers.image.revision="$GITHUB_SHA" --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" -t ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG .
           docker tag ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           docker push ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG
           docker push ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
