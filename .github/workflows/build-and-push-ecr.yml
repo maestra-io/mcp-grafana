@@ -93,33 +93,22 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        run: |
-          TAG=${{ steps.release-number.outputs.release-number }}
-          docker build --label org.opencontainers.image.revision="$GITHUB_SHA" --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" -t ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG .
-          docker tag ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          docker push ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG
-          docker push ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+      - uses: docker/setup-buildx-action@v4.4.1
 
-      # Was the phase 3 dual-push mirror of the ECR eu-central-1 -> us-west-2
-      # migration; phase 6 froze eu-central-1 and this workflow now pushes
-      # straight to us-west-2, so the mirror has nothing to copy and is off
-      # (https://github.com/maestra-io/issues-maestra/issues/1354, rake #8).
-      # This workflow pushes with its own docker push, so it bypasses the
-      # dual-push already built into the shared composite actions.
-      - name: Mirror images to the secondary ECR region (off since phase 6)
-        uses: maestra-io/github-actions/mirror-to-secondary-ecr@main
+      # BuildKit pushes only the layers ECR lacks; `docker push` from the fresh
+      # runner daemon re-uploaded every layer of every release.
+      - name: Build and push
+        uses: docker/build-push-action@v7.4.0
         with:
-          # Phase 6 (https://github.com/maestra-io/issues-maestra/issues/1354):
-          # eu-central-1 is frozen, us-west-2 is the only push target, so there
-          # is nothing left to mirror. Empty skips the whole step. Kept as a
-          # call so restoring a mirror is one value.
-          secondaryRegion: ''
-          repository: ${{ env.IMAGE_NAME }}
-          tag: ${{ steps.release-number.outputs.release-number }},latest
-          registry: ${{ env.ECR_REGISTRY }}
-          awsRoleArn: ${{ env.AWS_ROLE_ARN }}
-          awsWebIdentityTokenFile: /tmp/tbot-output/jwt_svid
+          context: .
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          provenance: false
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.release-number.outputs.release-number }}
+            ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
       - name: Create GitHub release
         uses: mindbox-moscow/github-actions/create-github-release@master
