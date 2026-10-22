@@ -27,7 +27,7 @@ jobs:
     env:
       DOCKER_BUILDKIT: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Get Teleport version
         id: tp-version
@@ -36,13 +36,13 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Cache Teleport binaries
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ runner.tool_cache }}/teleport
           key: teleport-${{ steps.tp-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install Teleport
-        uses: teleport-actions/setup@v1
+        uses: teleport-actions/setup@b638ff596557cc3959eb6b5287d5e58e0c8ac6a6 # v1.1.1
         with:
           version: ${{ steps.tp-version.outputs.version }}
           proxy: ${{ env.TELEPORT_FQDN }}
@@ -89,7 +89,7 @@ jobs:
 
       - name: Generate release number
         id: release-number
-        uses: mindbox-moscow/gha-release-number@master
+        uses: mindbox-moscow/gha-release-number@2e59ef5cea3cfc6df48854ec5718bfb520aa1337 # master
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -111,6 +111,6 @@ jobs:
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
       - name: Create GitHub release
-        uses: mindbox-moscow/github-actions/create-github-release@master
+        uses: mindbox-moscow/github-actions/create-github-release@658e5820721d2df8a446dc3e923411f83abb4746 # master
         with:
           release-number: ${{ steps.release-number.outputs.release-number }}
