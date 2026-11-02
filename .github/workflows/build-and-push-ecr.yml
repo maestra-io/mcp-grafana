@@ -114,7 +114,7 @@ jobs:
           provenance: false
           push: true
           cache-from: type=gha,scope=mcp-grafana
-          cache-to: type=gha,mode=max,scope=mcp-grafana
+          cache-to: type=gha,mode=max,scope=mcp-grafana,ignore-error=true
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.release-number.outputs.release-number }}
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
