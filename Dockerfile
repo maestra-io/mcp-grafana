@@ -26,6 +26,10 @@ LABEL io.modelcontextprotocol.server.name="io.github.grafana/mcp-grafana"
 
 # Install ca-certificates for HTTPS requests and upgrade existing packages
 # to pick up security fixes (e.g. OpenSSL) newer than the base image snapshot
+# BASE_REFRESH (CI passes the ISO week): the layer cache would otherwise serve
+# this stage forever, without apt/OS security updates. A new value rebuilds it
+# on the next build.
+ARG BASE_REFRESH
 RUN apt-get update && apt-get upgrade -y && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user
