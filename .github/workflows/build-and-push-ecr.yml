@@ -103,7 +103,7 @@ jobs:
       # Right before the build: the Docker secret carries a token minted here.
       - name: go modules through nora
         id: nora
-        uses: maestra-io/github-actions/go-nora@ba0bdfbe4f3e4795f441387e5f291b985e539338 # v1.62.1
+        uses: maestra-io/github-actions/go-nora@be3edebf65de183a5a0c3b02bcc0cd064198cdf5 # v1.62.4
 
       # BuildKit pushes only the layers ECR lacks; `docker push` from the fresh
       # runner daemon re-uploaded every layer of every release. The type=gha
