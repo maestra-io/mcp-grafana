@@ -100,6 +100,11 @@ jobs:
       - id: week
         run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
 
+      # Right before the build: the Docker secret carries a token minted here.
+      - name: go modules through nora
+        id: nora
+        uses: maestra-io/github-actions/go-nora@ba0bdfbe4f3e4795f441387e5f291b985e539338 # v1.62.1
+
       # BuildKit pushes only the layers ECR lacks; `docker push` from the fresh
       # runner daemon re-uploaded every layer of every release. The type=gha
       # layer cache keeps the go mod download layer between builds.
@@ -118,6 +123,8 @@ jobs:
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.release-number.outputs.release-number }}
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          secrets: |
+            PRIVATE_PACKAGES_TOKEN=${{ steps.nora.outputs.token }}
 
       - name: Create GitHub release
         uses: maestra-io/github-actions/create-github-release@df704636a89df5ddddc1ba836f8b09c796456ed7 # v1.49.0
