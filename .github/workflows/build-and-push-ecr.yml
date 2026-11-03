@@ -100,6 +100,11 @@ jobs:
       - id: week
         run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
 
+      # Right before the build: the Docker secret carries a token minted here.
+      - name: go modules through nora
+        id: nora
+        uses: maestra-io/github-actions/go-nora@be3edebf65de183a5a0c3b02bcc0cd064198cdf5 # v1.62.4
+
       # BuildKit pushes only the layers ECR lacks; `docker push` from the fresh
       # runner daemon re-uploaded every layer of every release. The type=gha
       # layer cache keeps the go mod download layer between builds.
@@ -119,6 +124,8 @@ jobs:
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.release-number.outputs.release-number }}
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          secrets: |
+            PRIVATE_PACKAGES_TOKEN=${{ steps.nora.outputs.token }}
 
       # The login step's JWT-SVID lives 5 minutes (Teleport default) and the
       # build can outlast it; the SBOM pull needs fresh AWS credentials.
