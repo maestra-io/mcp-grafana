@@ -120,6 +120,12 @@ jobs:
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.release-number.outputs.release-number }}
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
+      # The login step's JWT-SVID lives 5 minutes (Teleport default) and the
+      # build can outlast it; the SBOM pull needs fresh AWS credentials.
+      - name: Refresh the Teleport JWT for signing
+        continue-on-error: true
+        run: tbot start -c /tmp/tbot.yaml
+
       # Keyless cosign signature + CycloneDX SBOM attestation (issues-maestra#1648).
       # The tbot JWT is exported only inside the login step; hand it to aws here.
       - name: Sign and attest the image
