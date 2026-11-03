@@ -104,6 +104,7 @@ jobs:
       # runner daemon re-uploaded every layer of every release. The type=gha
       # layer cache keeps the go mod download layer between builds.
       - name: Build and push
+        id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
@@ -118,6 +119,16 @@ jobs:
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.release-number.outputs.release-number }}
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      # Keyless cosign signature + CycloneDX SBOM attestation (issues-maestra#1648).
+      # The tbot JWT is exported only inside the login step; hand it to aws here.
+      - name: Sign and attest the image
+        uses: maestra-io/github-actions/sign-image@bdfea43a7d47149012fa1a488c91e5d6a49b2744 # v1.62.2
+        env:
+          AWS_WEB_IDENTITY_TOKEN_FILE: /tmp/tbot-output/jwt_svid
+        with:
+          image: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}
+          digest: ${{ steps.push.outputs.digest }}
 
       - name: Create GitHub release
         uses: maestra-io/github-actions/create-github-release@df704636a89df5ddddc1ba836f8b09c796456ed7 # v1.49.0
