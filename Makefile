@@ -10,7 +10,7 @@ help: ## Print this help message.
 
 .PHONY: build-image
 build-image: ## Build the Docker image.
-	docker build -t mcp-grafana:latest .
+	docker build --secret id=PRIVATE_PACKAGES_TOKEN,env=PRIVATE_PACKAGES_TOKEN -t mcp-grafana:latest .
 
 .PHONY: build
 build: ## Build the binary.
