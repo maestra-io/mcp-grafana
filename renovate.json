@@ -11,7 +11,8 @@
         ":preserveSemverRanges",
         "schedule:weekly",
         "group:allNonMajor",
-        "github>grafana/grafana-renovate-config//presets/plugin-ci-workflows"
+        "github>grafana/grafana-renovate-config//presets/plugin-ci-workflows",
+        "github>maestra-io/renovate-config:externalImages"
     ],
     "minimumReleaseAge": "14 days",
     "rebaseWhen": "conflicted",
@@ -28,15 +29,15 @@
             "groupName": null
         },
         {
-            "description": "Group Docker digest updates and automerge",
+            "description": "Group Docker digest updates. No automerge: an external digest move is new content (issues-maestra#1649)",
             "matchDatasources": ["docker"],
             "matchUpdateTypes": ["digest"],
-            "groupName": "docker digest updates",
-            "automerge": true
+            "groupName": "docker digest updates"
         },
         {
             "description": "Automerge patch-level updates",
             "matchUpdateTypes": ["patch", "pin"],
+            "minimumReleaseAge": "14 days",
             "automerge": true
         }
     ]
