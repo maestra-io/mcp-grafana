@@ -26,6 +26,11 @@ Tests are using [`uv`] to manage dependencies. Install uv following the instruct
    uv sync --all-groups
    ```
 
+   Packages come only from nora (`packages.maestra.io`, the `maestra` index in
+   `pyproject.toml`), which needs a token: export
+   `UV_INDEX_MAESTRA_USERNAME=token` and `UV_INDEX_MAESTRA_PASSWORD=<your nra_ token>`
+   (see the packages-dev-setup docs). Without them `uv sync` / `uv lock` fail with 401.
+
 2. Create a `.env` file with your API keys:
    ```env
    OPENAI_API_KEY=sk-...
