@@ -24,3 +24,8 @@ dev = [
 
 [tool.pytest.ini_options]
 addopts = "-p no:flaky"
+
+[[tool.uv.index]]
+name = "maestra"
+url = "https://packages.maestra.io/simple/"
+default = true
