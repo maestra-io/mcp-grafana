@@ -1,17 +1,10 @@
 {
-    "ignorePresets": [
-        "github>grafana/grafana-renovate-config//presets/base",
-        "github>grafana/grafana-renovate-config//presets/automerge",
-        "github>grafana/grafana-renovate-config//presets/labels",
-        "github>grafana/grafana-renovate-config//presets/npm"
-    ],
     "extends": [
         "config:best-practices",
         ":disableDependencyDashboard",
         ":preserveSemverRanges",
         "schedule:weekly",
         "group:allNonMajor",
-        "github>grafana/grafana-renovate-config//presets/plugin-ci-workflows",
         "github>maestra-io/renovate-config:externalImages"
     ],
     "minimumReleaseAge": "14 days",
