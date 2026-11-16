@@ -212,7 +212,7 @@ The following tools are not registered when the flag is set:
 
 The `elasticsearch`, `quickwit`, `influxdb`, and `runpanelquery` categories contain nothing else, so they expose no tools at all when queries are disabled. Sibling tools such as `list_prometheus_metric_names`, `list_loki_label_values`, `describe_sql_table`, `list_cloudwatch_metrics`, and `list_cloud_logging_projects` remain available.
 
-The flag gates the query tools and the `grafana_api_request` POST-to-`/api/ds/query` path, but doesn't police every route to a datasource. In read-only mode, `grafana_api_request` allows POST to `/api/ds/query` only when query tools are enabled (same gate as the raw-SQL tools — blocked by `--disable-write` unless `--enable-query` overrides). `get_panel_image`, which renders a panel server-side, is unaffected.
+The flag gates the query tools and the `grafana_api_request` POST-to-`/api/ds/query` path, but doesn't police every route to a datasource. In read-only mode, `grafana_api_request` is GET-only unless `--enable-write-tools=grafana_api_request` names it, which adds POST to `/api/ds/query`. `--enable-query` doesn't open that path: `/api/ds/query` reaches every datasource, including HTTP datasources such as Infinity that hold API keys and send a caller-chosen method and body, so read-only SQL credentials don't make it safe. `get_panel_image`, which renders a panel server-side, is unaffected.
 
 ### Query execution and read-only mode
 

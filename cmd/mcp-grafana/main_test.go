@@ -24,6 +24,7 @@ import (
 	mcpgrafana "github.com/grafana/mcp-grafana/v2"
 	"github.com/grafana/mcp-grafana/v2/observability"
 	"github.com/grafana/mcp-grafana/v2/resources"
+	"github.com/grafana/mcp-grafana/v2/tools"
 	"github.com/grafana/mcp-grafana/v2/usagestats"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
@@ -1602,6 +1603,31 @@ func TestProcessTools_EnableQueryIsAliasForEnableWriteTools(t *testing.T) {
 		writeToolOverrides: "query_sql,query_influxdb",
 	})
 	assert.Equal(t, viaEnableQuery, viaWriteTools)
+}
+
+// --enable-query vouches for raw-SQL credentials only, so it must not let
+// grafana_api_request POST to /api/ds/query: that reaches Infinity datasources,
+// which send authenticated requests with a caller-chosen method and body.
+func TestProcessTools_APIRequestDSQueryNeedsItsOwnOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		dt   disabledTools
+		want *mcpgrafana.Tool
+	}{
+		{"default", disabledTools{}, &tools.APIRequest},
+		{"enable-query alone", disabledTools{enableQuery: true}, &tools.APIRequest},
+		{"disable-write", disabledTools{write: true}, &tools.APIRequestReadOnlyGetOnly},
+		{"disable-write enable-query", disabledTools{write: true, enableQuery: true}, &tools.APIRequestReadOnlyGetOnly},
+		{"disable-write raw-SQL overrides", disabledTools{write: true, writeToolOverrides: "query_sql,query_influxdb"}, &tools.APIRequestReadOnlyGetOnly},
+		{"disable-write api override", disabledTools{write: true, writeToolOverrides: "grafana_api_request"}, &tools.APIRequestReadOnly},
+		{"disable-query beats api override", disabledTools{write: true, query: true, writeToolOverrides: "grafana_api_request"}, &tools.APIRequestReadOnlyGetOnly},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listed := listAllCategoryTools(t, tc.dt)
+			require.Contains(t, listed, "grafana_api_request")
+			assert.Equal(t, tc.want.Tool.Description, listed["grafana_api_request"].Description)
+		})
+	}
 }
 
 func TestProcessTools_EnableWriteToolsRestoresWritableDeeplink(t *testing.T) {
