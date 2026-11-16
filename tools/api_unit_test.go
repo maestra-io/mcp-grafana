@@ -10,6 +10,7 @@ import (
 
 	mcpgrafana "github.com/grafana/mcp-grafana/v2"
 	"github.com/itchyny/gojq"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -456,4 +457,40 @@ func TestAPIRequestReadOnly_DeniesSnapshotDelete(t *testing.T) {
 
 	_, err := apiRequestReadOnlyGetOnly(ctx, APIRequestReadOnlyGetOnlyParams{Endpoint: "/api/snapshots"})
 	assert.NoError(t, err)
+}
+
+// The GET-only tool (registered under --disable-write, with or without
+// --enable-query) refuses a POST to /api/ds/query whatever the body claims about
+// the datasource, and never rejects a call over an undeclared "reason".
+func TestAPIRequest_GetOnlyToolRefusesSpoofedDSQueryAndIgnoresReason(t *testing.T) {
+	var calls []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(ts.Close)
+	ctx := apiTestContext(t, ts.URL)
+
+	call := func(args map[string]any) *mcp.CallToolResult {
+		raw, err := json.Marshal(args)
+		require.NoError(t, err)
+		result, err := APIRequestReadOnlyGetOnly.Handler(ctx, &mcp.CallToolRequest{
+			Params: &mcp.CallToolParamsRaw{Name: "grafana_api_request", Arguments: raw},
+		})
+		require.NoError(t, err)
+		return result
+	}
+
+	spoofed := `{"queries":[{"refId":"A","datasource":{"uid":"infinity-uid","type":"prometheus"},` +
+		`"url":"https://api.example/v2/servers","url_options":{"method":"POST","data":"{}"}}]}`
+	result := call(map[string]any{"endpoint": "/api/ds/query", "method": "POST", "body": spoofed, "reason": "spoof"})
+	assert.True(t, result.IsError, "POST /api/ds/query must be refused")
+	assert.Empty(t, calls, "nothing may reach Grafana for a refused call")
+
+	for _, reason := range []any{"why", "", 42, map[string]any{"x": 1}, nil} {
+		result = call(map[string]any{"endpoint": "/api/org", "reason": reason})
+		assert.False(t, result.IsError, "reason %v must not reject the call", reason)
+	}
+	assert.Len(t, calls, 5)
 }

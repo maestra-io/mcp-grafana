@@ -166,11 +166,16 @@ func (dt *disabledTools) queryToolsEnabled(category string) bool {
 	return true
 }
 
-func (dt *disabledTools) mutatingQueryToolsEnabled() bool {
+// apiDSQueryEnabled reports whether grafana_api_request may POST to
+// /api/ds/query. That endpoint reaches every datasource, including HTTP ones
+// such as Infinity that hold API keys and send a caller-chosen method and body,
+// so --enable-query (which vouches for raw-SQL credentials) does not open it;
+// naming grafana_api_request in --enable-write-tools does.
+func (dt *disabledTools) apiDSQueryEnabled() bool {
 	if dt.query {
 		return false
 	}
-	return dt.writeToolEnabled(enableQueryToolNames...)
+	return dt.writeToolEnabled(tools.APIRequest.Tool.Name)
 }
 
 type disabledTools struct {
@@ -477,7 +482,7 @@ func (dt *disabledTools) toolEntries() []toolEntry {
 		{func(s *mcp.Server) { tools.AddRunPanelQueryTools(s, enableQueryTools) }, dt.runpanelquery, "runpanelquery"},
 		{func(s *mcp.Server) { tools.AddGraphiteTools(s, enableQueryTools) }, dt.graphite, "graphite"},
 		{func(s *mcp.Server) { tools.AddPluginTools(s, enableWriteTools) }, dt.plugin, "plugin"},
-		{func(s *mcp.Server) { tools.AddAPITools(s, enableWriteTools, dt.mutatingQueryToolsEnabled()) }, dt.api, "api"},
+		{func(s *mcp.Server) { tools.AddAPITools(s, enableWriteTools, dt.apiDSQueryEnabled()) }, dt.api, "api"},
 		{tools.AddConfigTools, dt.config, "config"},
 		{tools.AddProvisioningTools, dt.provisioning, "provisioning"},
 		{func(s *mcp.Server) { tools.AddAgento11yTools(s, enableWriteTools) }, dt.agento11y, "agento11y"},

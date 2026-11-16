@@ -271,10 +271,12 @@ var APIRequestReadOnlyGetOnly = mcpgrafana.MustTool(
 	mcpgrafana.RequiresPermissions(),
 )
 
-func AddAPITools(s *mcp.Server, enableWriteTools bool, enableQueryTools bool) {
+// AddAPITools registers grafana_api_request: unrestricted with write tools,
+// otherwise GET-only, plus POST /api/ds/query when allowDSQuery is set.
+func AddAPITools(s *mcp.Server, enableWriteTools bool, allowDSQuery bool) {
 	if enableWriteTools {
 		APIRequest.Register(s)
-	} else if enableQueryTools {
+	} else if allowDSQuery {
 		APIRequestReadOnly.Register(s)
 	} else {
 		APIRequestReadOnlyGetOnly.Register(s)

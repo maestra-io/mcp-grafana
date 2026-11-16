@@ -697,7 +697,7 @@ When `--disable-query` is enabled, the following tools are not registered:
 
 The `elasticsearch`, `quickwit`, `influxdb`, and `runpanelquery` categories contain nothing else, so they register no tools at all when queries are disabled. The sibling tools in every other category — `list_prometheus_metric_names`, `list_loki_label_values`, `describe_sql_table`, `list_cloudwatch_metrics`, `list_cloud_logging_projects`, and so on — remain available.
 
-Note that `--disable-query` gates the query tools and the `grafana_api_request` POST-to-`/api/ds/query` path, but does not police every route to a datasource. In read-only mode, `grafana_api_request` allows POST to `/api/ds/query` only when query tools are enabled (same gate as the raw-SQL tools — blocked by `--disable-write` unless `--enable-query` overrides). `get_panel_image`, which renders a panel server-side, is unaffected.
+Note that `--disable-query` gates the query tools and the `grafana_api_request` POST-to-`/api/ds/query` path, but does not police every route to a datasource. In read-only mode, `grafana_api_request` is GET-only unless `--enable-write-tools=grafana_api_request` names it, which adds POST to `/api/ds/query`. `--enable-query` doesn't open that path: `/api/ds/query` reaches every datasource, including HTTP datasources such as Infinity that hold API keys and send a caller-chosen method and body, so read-only SQL credentials don't make it safe. `get_panel_image`, which renders a panel server-side, is unaffected.
 
 **Client TLS Configuration (for Grafana connections):**
 - `--tls-cert-file`: Path to TLS certificate file for client authentication

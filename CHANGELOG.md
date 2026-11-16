@@ -20,6 +20,7 @@ Merged upstream v2.3.0 into the fork. Fork features kept on top of upstream:
 - `alerting_manage_rules` remains as an alias with its old parameters: read-only (list, get, versions) by default under `--disable-write`, read-write (also create, update, delete) when `alerting_rules_write` is registered. New callers use `alerting_rules_read` / `alerting_rules_write` and `alerting_silences_read` / `alerting_silences_write`.
 - `update_dashboard` in the Kubernetes object form keeps the caller's other `metadata.annotations` and `metadata.labels` on the v2 write.
 - The read-only `grafana_api_request` variants refuse `/api/snapshots-delete/…`, which Grafana serves as a deleting GET.
+- Under `--disable-write`, `--enable-query` no longer lets `grafana_api_request` POST to `/api/ds/query`; it stays GET-only unless `--enable-write-tools=grafana_api_request` names it. `/api/ds/query` reaches Infinity datasources, which hold API keys and send a caller-chosen method and body. `query_sql` / `query_clickhouse` are unaffected: they resolve the datasource type server-side and refuse non-SQL types.
 
 ### Removed or changed upstream (no fork alias)
 
