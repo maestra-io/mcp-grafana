@@ -6,13 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"reflect"
 	"strings"
 
 	aapi "github.com/grafana/amixr-api-go-client"
-	mcpgrafana "github.com/grafana/mcp-grafana"
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
+	mcpgrafana "github.com/grafana/mcp-grafana/v2"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // getOnCallURLFromSettings retrieves the OnCall API URL from the Grafana settings endpoint.
@@ -75,10 +73,9 @@ func oncallClientFromContext(ctx context.Context) (*aapi.Client, error) {
 
 	grafanaOnCallURL = strings.TrimRight(grafanaOnCallURL, "/")
 
-	// Use the dedicated OnCall personal token if set, otherwise fall back to the
-	// service account token. Personal tokens are required for mutating actions
-	// (acknowledge, resolve, silence) because Grafana OnCall rejects those from
-	// service accounts.
+	// Prefer the dedicated OnCall personal token: OnCall rejects mutating
+	// actions (acknowledge, resolve, silence) from service accounts. Fall back
+	// to the service account token for read-only use.
 	token := cfg.OnCallToken
 	if token == "" {
 		token = cfg.APIKey
@@ -95,33 +92,25 @@ func oncallClientFromContext(ctx context.Context) (*aapi.Client, error) {
 		return nil, fmt.Errorf("creating OnCall client: %w", err)
 	}
 
-	// Customize the HTTP client's transport using reflection since the
-	// OnCall client doesn't expose its HTTP client directly. Auth is
-	// handled by the OnCall library (API key passed above), so we skip it.
-	clientValue := reflect.ValueOf(client)
-	if clientValue.Kind() == reflect.Ptr && !clientValue.IsNil() {
-		clientValue = clientValue.Elem()
-		if clientValue.Kind() == reflect.Struct {
-			httpClientField := clientValue.FieldByName("HTTPClient")
-			if !httpClientField.IsValid() {
-				httpClientField = clientValue.FieldByName("HttpClient")
-			}
-			if !httpClientField.IsValid() {
-				httpClientField = clientValue.FieldByName("Client")
-			}
-			if httpClientField.IsValid() && httpClientField.CanSet() {
-				if httpClient, ok := httpClientField.Interface().(*http.Client); ok {
-					transport, err := mcpgrafana.BuildTransport(&cfg, nil, mcpgrafana.WithoutAuth())
-					if err != nil {
-						return nil, fmt.Errorf("building transport for OnCall client: %w", err)
-					}
-					httpClient.Transport = transport
-				}
-			}
-		}
+	transport, err := oncallTransport(cfg, grafanaOnCallURL)
+	if err != nil {
+		// Fail closed: a default transport would drop TLS/proxy/URL-guard
+		// settings and the 30s timeout.
+		return nil, fmt.Errorf("building transport for OnCall client: %w", err)
 	}
+	client.SetHTTPClient(&http.Client{Transport: transport})
 
 	return client, nil
+}
+
+// oncallTransport builds the transport for public OnCall API requests to
+// oncallURL. Auth is handled by the OnCall library, so it is skipped here.
+func oncallTransport(cfg mcpgrafana.GrafanaConfig, oncallURL string) (http.RoundTripper, error) {
+	if cfg.OverrideURL != "" {
+		// Trust the onCallApiUrl reported by the allowlisted Grafana, and nothing else.
+		cfg.OverrideURL = oncallURL
+	}
+	return mcpgrafana.BuildTransport(&cfg, nil, mcpgrafana.WithoutAuth())
 }
 
 // --- Schedules ---
@@ -207,9 +196,12 @@ var ListOnCallSchedules = mcpgrafana.MustTool(
 	"list_oncall_schedules",
 	"List Grafana OnCall schedules, optionally filtering by team ID. If a specific schedule ID is provided, retrieves details for only that schedule. Returns a list of schedule summaries including ID, name, team ID, timezone, and shift IDs. Supports pagination.",
 	listOnCallSchedules,
-	mcp.WithTitleAnnotation("List OnCall schedules"),
-	mcp.WithIdempotentHintAnnotation(true),
-	mcp.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithTitleAnnotation("List OnCall schedules"),
+	mcpgrafana.WithIdempotentHintAnnotation(true),
+	mcpgrafana.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithDestructiveHintAnnotation(false),
+	mcpgrafana.WithOpenWorldHintAnnotation(false),
+	mcpgrafana.RequiresPermissions("plugins.app:access", "grafana-irm-app.schedules:read"),
 )
 
 // --- Shifts ---
@@ -257,9 +249,12 @@ var GetOnCallShift = mcpgrafana.MustTool(
 	"get_oncall_shift",
 	"Get detailed information for a specific Grafana OnCall shift using its ID. A shift represents a designated time period within a schedule when users are actively on-call. Returns the full shift details.",
 	getOnCallShift,
-	mcp.WithTitleAnnotation("Get OnCall shift"),
-	mcp.WithIdempotentHintAnnotation(true),
-	mcp.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithTitleAnnotation("Get OnCall shift"),
+	mcpgrafana.WithIdempotentHintAnnotation(true),
+	mcpgrafana.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithDestructiveHintAnnotation(false),
+	mcpgrafana.WithOpenWorldHintAnnotation(false),
+	mcpgrafana.RequiresPermissions("plugins.app:access", "grafana-irm-app.schedules:read"),
 )
 
 // --- Current On-Call Users ---
@@ -304,13 +299,12 @@ func amixrGetCurrentOnCallUsers(ctx context.Context, scheduleID string) (*Curren
 		return result, nil
 	}
 
-	// Fetch details for each user currently on call.
 	userService := aapi.NewUserService(client)
 	logger := mcpgrafana.GrafanaConfigFromContext(ctx).LoggerOrDefault()
 	for _, userID := range schedule.OnCallNow {
 		user, _, err := userService.GetUser(userID, &aapi.GetUserOptions{})
 		if err != nil {
-			// Log the error but continue with other users.
+			// Keep the other users, but leave a trace of the gap.
 			logger.Warn("Failed to fetch OnCall user", "user_id", userID, "error", err)
 			continue
 		}
@@ -329,9 +323,14 @@ var GetCurrentOnCallUsers = mcpgrafana.MustTool(
 	"get_current_oncall_users",
 	"Get the list of users currently on-call for a specific Grafana OnCall schedule ID. Returns the schedule ID, name, and a list of detailed user objects for those currently on call.",
 	getCurrentOnCallUsers,
-	mcp.WithTitleAnnotation("Get current on-call users"),
-	mcp.WithIdempotentHintAnnotation(true),
-	mcp.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithTitleAnnotation("Get current on-call users"),
+	mcpgrafana.WithIdempotentHintAnnotation(true),
+	mcpgrafana.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithDestructiveHintAnnotation(false),
+	mcpgrafana.WithOpenWorldHintAnnotation(false),
+	mcpgrafana.RequiresPermissions(
+		"plugins.app:access", "grafana-irm-app.schedules:read", "grafana-irm-app.user-settings:read",
+	),
 )
 
 // --- Teams ---
@@ -380,9 +379,12 @@ var ListOnCallTeams = mcpgrafana.MustTool(
 	"list_oncall_teams",
 	"List teams configured in Grafana OnCall. Returns a list of team objects with their details. Supports pagination.",
 	listOnCallTeams,
-	mcp.WithTitleAnnotation("List OnCall teams"),
-	mcp.WithIdempotentHintAnnotation(true),
-	mcp.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithTitleAnnotation("List OnCall teams"),
+	mcpgrafana.WithIdempotentHintAnnotation(true),
+	mcpgrafana.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithDestructiveHintAnnotation(false),
+	mcpgrafana.WithOpenWorldHintAnnotation(false),
+	mcpgrafana.RequiresPermissions("plugins.app:access", "grafana-irm-app.user-settings:read"),
 )
 
 // --- Users ---
@@ -450,23 +452,15 @@ var ListOnCallUsers = mcpgrafana.MustTool(
 	"list_oncall_users",
 	"List users from Grafana OnCall. These are OnCall users (separate from Grafana users). Can retrieve all users in the OnCall directory, a specific user by ID, or filter by username. Returns a list of user objects with their details. Supports pagination.",
 	listOnCallUsers,
-	mcp.WithTitleAnnotation("List OnCall users"),
-	mcp.WithIdempotentHintAnnotation(true),
-	mcp.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithTitleAnnotation("List OnCall users"),
+	mcpgrafana.WithIdempotentHintAnnotation(true),
+	mcpgrafana.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithDestructiveHintAnnotation(false),
+	mcpgrafana.WithOpenWorldHintAnnotation(false),
+	mcpgrafana.RequiresPermissions("plugins.app:access", "grafana-irm-app.user-settings:read"),
 )
 
 // --- Alert Groups ---
-
-// getAlertGroupServiceFromContext creates a new AlertGroupService using the
-// OnCall client from the context.
-func getAlertGroupServiceFromContext(ctx context.Context) (*aapi.AlertGroupService, error) {
-	client, err := oncallClientFromContext(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting OnCall client: %w", err)
-	}
-
-	return aapi.NewAlertGroupService(client), nil
-}
 
 type ListAlertGroupsParams struct {
 	Page          int      `json:"page,omitempty" jsonschema:"description=The page number to return"`
@@ -550,9 +544,12 @@ var ListAlertGroups = mcpgrafana.MustTool(
 	"list_alert_groups",
 	"List alert groups from Grafana OnCall with filtering options. Supports filtering by alert group ID, route ID, integration ID, state (new, acknowledged, resolved, silenced), team ID, time range, labels, and name. For time ranges, use format '{start}_{end}' ISO 8601 timestamp range (e.g., '2025-01-19T00:00:00_2025-01-19T23:59:59' for a specific day). For labels, use format 'key:value' (e.g., ['env:prod', 'severity:high']). Returns a list of alert group objects with their details. Supports pagination.",
 	listAlertGroups,
-	mcp.WithTitleAnnotation("List IRM alert groups"),
-	mcp.WithIdempotentHintAnnotation(true),
-	mcp.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithTitleAnnotation("List IRM alert groups"),
+	mcpgrafana.WithIdempotentHintAnnotation(true),
+	mcpgrafana.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithDestructiveHintAnnotation(false),
+	mcpgrafana.WithOpenWorldHintAnnotation(false),
+	mcpgrafana.RequiresPermissions("plugins.app:access", "grafana-irm-app.alert-groups:read"),
 )
 
 type GetAlertGroupParams struct {
@@ -560,7 +557,8 @@ type GetAlertGroupParams struct {
 }
 
 func getAlertGroup(ctx context.Context, args GetAlertGroupParams) (*OnCallAlertGroup, error) {
-	if strings.TrimSpace(args.AlertGroupID) == "" {
+	args.AlertGroupID = strings.TrimSpace(args.AlertGroupID)
+	if args.AlertGroupID == "" {
 		return nil, fmt.Errorf("alertGroupId is required")
 	}
 	if useOncallProxy(ctx) {
@@ -569,55 +567,198 @@ func getAlertGroup(ctx context.Context, args GetAlertGroupParams) (*OnCallAlertG
 	return amixrGetAlertGroup(ctx, args.AlertGroupID)
 }
 
-// amixrGetAlertGroup fetches a single alert group via the OnCall HTTP API
-// directly instead of through amixr-api-go-client's
-// AlertGroupService.GetAlertGroup, which unmarshals into a struct that doesn't
-// declare acknowledged_by, resolved_by, silenced_at, route_id, or last_alert and
-// therefore drops them. We decode straight into *OnCallAlertGroup so those
-// detail fields are preserved.
-func amixrGetAlertGroup(ctx context.Context, alertGroupID string) (*OnCallAlertGroup, error) {
-	alertGroupID = strings.TrimSpace(alertGroupID)
-	if alertGroupID == "" {
-		return nil, fmt.Errorf("alertGroupId is required")
-	}
+// oncallAlertGroupPublic mirrors the public OnCall API's alert group response.
+//
+// It exists because aapi.AlertGroup omits last_alert, and aapi.Alert types its
+// payload as a fixed struct that would discard integration-specific fields. The
+// request below therefore bypasses aapi.AlertGroupService and decodes into this
+// type instead.
+type oncallAlertGroupPublic struct {
+	ID             string            `json:"id"`
+	IntegrationID  string            `json:"integration_id"`
+	RouteID        string            `json:"route_id"`
+	AlertsCount    int               `json:"alerts_count"`
+	State          string            `json:"state"`
+	CreatedAt      string            `json:"created_at"`
+	ResolvedAt     string            `json:"resolved_at"`
+	AcknowledgedAt string            `json:"acknowledged_at"`
+	AcknowledgedBy string            `json:"acknowledged_by"`
+	ResolvedBy     string            `json:"resolved_by"`
+	SilencedAt     string            `json:"silenced_at"`
+	Title          string            `json:"title"`
+	Permalinks     map[string]string `json:"permalinks"`
+	LastAlert      *OnCallLastAlert  `json:"last_alert"`
+}
 
+func amixrGetAlertGroup(ctx context.Context, alertGroupID string) (*OnCallAlertGroup, error) {
 	client, err := oncallClientFromContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getting OnCall client: %w", err)
 	}
 
-	escapedID := url.PathEscape(alertGroupID)
-	path := fmt.Sprintf("alert_groups/%s/", escapedID)
-	req, err := client.NewRequest("GET", path, nil)
+	// Mirrors aapi.AlertGroupService.GetAlertGroup's path construction.
+	path := fmt.Sprintf("alert_groups/%s/", url.PathEscape(alertGroupID))
+	req, err := client.NewRequest(http.MethodGet, path, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating get_alert_group request: %w", err)
+		return nil, fmt.Errorf("creating OnCall alert group request %s: %w", alertGroupID, err)
 	}
 
-	var alertGroup *OnCallAlertGroup
-	if _, err = client.Do(req, &alertGroup); err != nil {
+	var ag oncallAlertGroupPublic
+	if _, err := client.Do(req, &ag); err != nil {
 		return nil, fmt.Errorf("getting OnCall alert group %s: %w", alertGroupID, err)
 	}
-	if alertGroup == nil {
-		return nil, fmt.Errorf("getting OnCall alert group %s: empty response", alertGroupID)
-	}
 
-	return alertGroup, nil
+	return &OnCallAlertGroup{
+		ID:             ag.ID,
+		IntegrationID:  ag.IntegrationID,
+		RouteID:        ag.RouteID,
+		AlertsCount:    ag.AlertsCount,
+		State:          ag.State,
+		CreatedAt:      ag.CreatedAt,
+		ResolvedAt:     ag.ResolvedAt,
+		AcknowledgedAt: ag.AcknowledgedAt,
+		AcknowledgedBy: ag.AcknowledgedBy,
+		ResolvedBy:     ag.ResolvedBy,
+		SilencedAt:     ag.SilencedAt,
+		Title:          ag.Title,
+		Permalinks:     ag.Permalinks,
+		LastAlert:      ag.LastAlert,
+	}, nil
 }
 
 var GetAlertGroup = mcpgrafana.MustTool(
 	"get_alert_group",
-	"Get a specific alert group from Grafana OnCall by its ID. Returns the full alert group details, including fields not exposed by list_alert_groups: acknowledged_by, resolved_by, silenced_at, and last_alert (most recent individual alert with its raw payload).",
+	"Get a specific alert group from Grafana OnCall by its ID. Returns the full alert group details, including detail fields not returned when listing (route_id, acknowledged_by, resolved_by, silenced_at) and the most recent alert and its raw payload when the OnCall API provides them. Alert payloads carry integration-specific fingerprints (for example Sentry's payload.data.event.hashes or Alertmanager's payload.alerts[].fingerprint) that identify recurring alerts across different alert groups.",
 	getAlertGroup,
-	mcp.WithTitleAnnotation("Get IRM alert group"),
-	mcp.WithIdempotentHintAnnotation(true),
-	mcp.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithTitleAnnotation("Get IRM alert group"),
+	mcpgrafana.WithIdempotentHintAnnotation(true),
+	mcpgrafana.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithDestructiveHintAnnotation(false),
+	mcpgrafana.WithOpenWorldHintAnnotation(false),
+	mcpgrafana.RequiresPermissions("plugins.app:access", "grafana-irm-app.alert-groups:read"),
 )
 
-// alertGroupAction performs a POST action on an alert group (resolve, acknowledge, etc.).
-// The amixr-api-go-client library doesn't expose these action methods, so we call the API directly.
-// OnCall returns 200 with an empty body for these action endpoints, so we fetch the updated
-// alert group separately with a GET request.
-// body, if non-nil, is sent as a URL-encoded form payload (required by some endpoints like silence).
+type UpdateAlertGroupParams struct {
+	AlertGroupID string `json:"alertGroupId" jsonschema:"required,description=The ID of the alert group to update"`
+	State        string `json:"state" jsonschema:"required,description=New state for the alert group. One of: acknowledged\\, unacknowledged\\, resolved\\, unresolved"`
+}
+
+type UpdateAlertGroupResult struct {
+	AlertGroupID string `json:"alertGroupId"`
+	Action       string `json:"action"`
+	Updated      bool   `json:"updated"`
+	State        string `json:"state,omitempty"`
+	StateWarning string `json:"stateWarning,omitempty"`
+}
+
+// alertGroupActionForState maps a requested end state onto the OnCall action
+// endpoint that produces it. OnCall has no single "set the state" endpoint;
+// every transition is its own POST, and "unacknowledged"/"unresolved" name
+// transitions rather than states (OnCall itself only ever reports new,
+// acknowledged, resolved or silenced).
+func alertGroupActionForState(state string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "acknowledged":
+		return "acknowledge", nil
+	case "unacknowledged":
+		return "unacknowledge", nil
+	case "resolved":
+		return "resolve", nil
+	case "unresolved":
+		return "unresolve", nil
+	default:
+		return "", fmt.Errorf("unsupported alert group state %q: expected acknowledged, unacknowledged, resolved, or unresolved", state)
+	}
+}
+
+// updateAlertGroup transitions an alert group and then reads it back, so the
+// caller is told OnCall's real resulting state instead of the transition it
+// asked for. The write has already been committed by the time the read runs,
+// so a read failure is reported in stateWarning rather than as a tool error:
+// failing the call would invite a caller to retry a mutation that has already
+// happened. Note this means the tool wants alert-groups:read alongside
+// alert-groups:write to return a state at all.
+func updateAlertGroup(ctx context.Context, args UpdateAlertGroupParams) (*UpdateAlertGroupResult, error) {
+	if strings.TrimSpace(args.AlertGroupID) == "" {
+		return nil, fmt.Errorf("alertGroupId is required")
+	}
+
+	action, err := alertGroupActionForState(args.State)
+	if err != nil {
+		return nil, err
+	}
+
+	if useOncallProxy(ctx) {
+		err = proxyUpdateAlertGroup(ctx, args.AlertGroupID, action)
+	} else {
+		err = amixrUpdateAlertGroup(ctx, args.AlertGroupID, action)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	result := &UpdateAlertGroupResult{
+		AlertGroupID: args.AlertGroupID,
+		Action:       action,
+		Updated:      true,
+	}
+
+	ag, err := getAlertGroup(ctx, GetAlertGroupParams{AlertGroupID: args.AlertGroupID})
+	if err != nil {
+		result.StateWarning = fmt.Sprintf(
+			"the %s succeeded but the resulting state could not be read back (does the caller have alert-groups:read?): %s",
+			action, err,
+		)
+		return result, nil
+	}
+	result.State = ag.State
+
+	return result, nil
+}
+
+func amixrUpdateAlertGroup(ctx context.Context, alertGroupID, action string) error {
+	client, err := oncallClientFromContext(ctx)
+	if err != nil {
+		return fmt.Errorf("getting OnCall client: %w", err)
+	}
+
+	path := fmt.Sprintf("alert_groups/%s/%s", url.PathEscape(alertGroupID), action)
+	req, err := client.NewRequest(http.MethodPost, path, nil)
+	if err != nil {
+		return fmt.Errorf("creating OnCall %s request for alert group %s: %w", action, alertGroupID, err)
+	}
+
+	if _, err := client.Do(req, nil); err != nil {
+		return fmt.Errorf("%s OnCall alert group %s: %w", action, alertGroupID, err)
+	}
+	return nil
+}
+
+var UpdateAlertGroup = mcpgrafana.MustTool(
+	"update_alert_group",
+	"Update the state of a Grafana OnCall alert group: acknowledge, unacknowledge, resolve, or unresolve it by ID. Returns the alert group's resulting OnCall state (one of new, acknowledged, resolved, silenced), or a stateWarning explaining why that state could not be read back after a successful update.",
+	updateAlertGroup,
+	mcpgrafana.WithTitleAnnotation("Update IRM alert group"),
+	mcpgrafana.WithIdempotentHintAnnotation(false),
+	mcpgrafana.WithReadOnlyHintAnnotation(false),
+	mcpgrafana.WithDestructiveHintAnnotation(true),
+	mcpgrafana.WithOpenWorldHintAnnotation(false),
+	mcpgrafana.RequiresPermissions(
+		"plugins.app:access", "grafana-irm-app.alert-groups:read", "grafana-irm-app.alert-groups:write",
+	),
+)
+
+// --- Alert group actions (maestra-io fork) ---
+//
+// One tool per OnCall action, kept next to upstream's update_alert_group for
+// existing callers; silence/unsilence have no upstream equivalent. They call the
+// public OnCall API with GRAFANA_ONCALL_TOKEN (falling back to the service
+// account token), since OnCall rejects these actions from service accounts.
+
+// alertGroupAction POSTs alert_groups/<id>/<action>/ and returns the updated
+// alert group. OnCall answers 200 with an empty body, so the new state is read
+// back with a GET. body, if non-nil, is sent as the request payload (silence
+// needs {"delay": N}).
 func alertGroupAction(ctx context.Context, alertGroupID, action string, body interface{}) (*aapi.AlertGroup, error) {
 	alertGroupID = strings.TrimSpace(alertGroupID)
 	if alertGroupID == "" {
@@ -629,19 +770,16 @@ func alertGroupAction(ctx context.Context, alertGroupID, action string, body int
 		return nil, fmt.Errorf("getting OnCall client: %w", err)
 	}
 
-	escapedID := url.PathEscape(alertGroupID)
-	path := fmt.Sprintf("alert_groups/%s/%s/", escapedID, action)
-	req, err := client.NewRequest("POST", path, body)
+	path := fmt.Sprintf("alert_groups/%s/%s/", url.PathEscape(alertGroupID), action)
+	req, err := client.NewRequest(http.MethodPost, path, body)
 	if err != nil {
 		return nil, fmt.Errorf("creating %s request: %w", action, err)
 	}
-
-	// Pass nil so the client doesn't try to JSON-decode the empty response body.
+	// nil target: the action response body is empty.
 	if _, err = client.Do(req, nil); err != nil {
 		return nil, fmt.Errorf("%s alert group %s: %w", action, alertGroupID, err)
 	}
 
-	// Fetch the updated alert group to return the new state.
 	alertGroup, _, err := aapi.NewAlertGroupService(client).GetAlertGroup(alertGroupID)
 	if err != nil {
 		return nil, fmt.Errorf("fetching alert group %s after %s: %w", alertGroupID, action, err)
@@ -649,7 +787,6 @@ func alertGroupAction(ctx context.Context, alertGroupID, action string, body int
 	if alertGroup == nil {
 		return nil, fmt.Errorf("fetching alert group %s after %s: empty response", alertGroupID, action)
 	}
-
 	return alertGroup, nil
 }
 
@@ -657,37 +794,44 @@ type AlertGroupActionParams struct {
 	AlertGroupID string `json:"alertGroupId" jsonschema:"required,description=The ID of the alert group to perform the action on"`
 }
 
-func acknowledgeAlertGroup(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
-	return alertGroupAction(ctx, args.AlertGroupID, "acknowledge", nil)
+func alertGroupActionTool(name, title, description, action string) mcpgrafana.Tool {
+	return mcpgrafana.MustTool(
+		name,
+		description,
+		func(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
+			return alertGroupAction(ctx, args.AlertGroupID, action, nil)
+		},
+		mcpgrafana.WithTitleAnnotation(title),
+		mcpgrafana.WithIdempotentHintAnnotation(false),
+		mcpgrafana.WithReadOnlyHintAnnotation(false),
+		mcpgrafana.WithDestructiveHintAnnotation(true),
+		mcpgrafana.WithOpenWorldHintAnnotation(false),
+		mcpgrafana.RequiresPermissions("plugins.app:access", "grafana-irm-app.alert-groups:read", "grafana-irm-app.alert-groups:write"),
+	)
 }
 
-var AcknowledgeAlertGroup = mcpgrafana.MustTool(
-	"acknowledge_alert_group",
+var AcknowledgeAlertGroup = alertGroupActionTool(
+	"acknowledge_alert_group", "Acknowledge alert group",
 	"Acknowledge a specific Grafana OnCall alert group by its ID. Changes the alert group state to 'acknowledged'. Returns the updated alert group.",
-	acknowledgeAlertGroup,
-	mcp.WithTitleAnnotation("Acknowledge alert group"),
+	"acknowledge",
 )
 
-func unacknowledgeAlertGroup(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
-	return alertGroupAction(ctx, args.AlertGroupID, "unacknowledge", nil)
-}
-
-var UnacknowledgeAlertGroup = mcpgrafana.MustTool(
-	"unacknowledge_alert_group",
+var UnacknowledgeAlertGroup = alertGroupActionTool(
+	"unacknowledge_alert_group", "Unacknowledge alert group",
 	"Unacknowledge a specific Grafana OnCall alert group by its ID. Reverts the alert group state from 'acknowledged' back to 'new'. Returns the updated alert group.",
-	unacknowledgeAlertGroup,
-	mcp.WithTitleAnnotation("Unacknowledge alert group"),
+	"unacknowledge",
 )
 
-func resolveAlertGroup(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
-	return alertGroupAction(ctx, args.AlertGroupID, "resolve", nil)
-}
-
-var ResolveAlertGroup = mcpgrafana.MustTool(
-	"resolve_alert_group",
+var ResolveAlertGroup = alertGroupActionTool(
+	"resolve_alert_group", "Resolve alert group",
 	"Resolve a specific Grafana OnCall alert group by its ID. Changes the alert group state to 'resolved'. Returns the updated alert group.",
-	resolveAlertGroup,
-	mcp.WithTitleAnnotation("Resolve alert group"),
+	"resolve",
+)
+
+var UnsilenceAlertGroup = alertGroupActionTool(
+	"unsilence_alert_group", "Unsilence alert group",
+	"Unsilence a specific Grafana OnCall alert group by its ID. Reverts the alert group state from 'silenced'. Returns the updated alert group.",
+	"unsilence",
 )
 
 type SilenceAlertGroupParams struct {
@@ -696,41 +840,37 @@ type SilenceAlertGroupParams struct {
 }
 
 func silenceAlertGroup(ctx context.Context, args SilenceAlertGroupParams) (*aapi.AlertGroup, error) {
-	body := map[string]int{"delay": args.Delay}
-	return alertGroupAction(ctx, args.AlertGroupID, "silence", body)
+	return alertGroupAction(ctx, args.AlertGroupID, "silence", map[string]int{"delay": args.Delay})
 }
 
 var SilenceAlertGroup = mcpgrafana.MustTool(
 	"silence_alert_group",
 	"Silence a specific Grafana OnCall alert group by its ID for a given duration. Changes the alert group state to 'silenced'. The 'delay' parameter is required — use -1 to silence forever, or a positive number of seconds (e.g., 3600 for one hour). Returns the updated alert group.",
 	silenceAlertGroup,
-	mcp.WithTitleAnnotation("Silence alert group"),
+	mcpgrafana.WithTitleAnnotation("Silence alert group"),
+	mcpgrafana.WithIdempotentHintAnnotation(false),
+	mcpgrafana.WithReadOnlyHintAnnotation(false),
+	mcpgrafana.WithDestructiveHintAnnotation(true),
+	mcpgrafana.WithOpenWorldHintAnnotation(false),
+	mcpgrafana.RequiresPermissions("plugins.app:access", "grafana-irm-app.alert-groups:read", "grafana-irm-app.alert-groups:write"),
 )
 
-func unsilenceAlertGroup(ctx context.Context, args AlertGroupActionParams) (*aapi.AlertGroup, error) {
-	return alertGroupAction(ctx, args.AlertGroupID, "unsilence", nil)
-}
-
-var UnsilenceAlertGroup = mcpgrafana.MustTool(
-	"unsilence_alert_group",
-	"Unsilence a specific Grafana OnCall alert group by its ID. Reverts the alert group state from 'silenced'. Returns the updated alert group.",
-	unsilenceAlertGroup,
-	mcp.WithTitleAnnotation("Unsilence alert group"),
-)
-
-func AddOnCallTools(mcp *server.MCPServer) {
-	ListOnCallSchedules.Register(mcp)
-	GetOnCallShift.Register(mcp)
-	GetCurrentOnCallUsers.Register(mcp)
-	ListOnCallTeams.Register(mcp)
-	ListOnCallUsers.Register(mcp)
-	ListAlertGroups.Register(mcp)
-	GetAlertGroup.Register(mcp)
-	AcknowledgeAlertGroup.Register(mcp)
-	UnacknowledgeAlertGroup.Register(mcp)
-	ResolveAlertGroup.Register(mcp)
-	SilenceAlertGroup.Register(mcp)
-	UnsilenceAlertGroup.Register(mcp)
+func AddOnCallTools(s *mcp.Server, enableWriteTools bool) {
+	ListOnCallSchedules.Register(s)
+	GetOnCallShift.Register(s)
+	GetCurrentOnCallUsers.Register(s)
+	ListOnCallTeams.Register(s)
+	ListOnCallUsers.Register(s)
+	ListAlertGroups.Register(s)
+	GetAlertGroup.Register(s)
+	if enableWriteTools {
+		UpdateAlertGroup.Register(s)
+		AcknowledgeAlertGroup.Register(s)
+		UnacknowledgeAlertGroup.Register(s)
+		ResolveAlertGroup.Register(s)
+		SilenceAlertGroup.Register(s)
+		UnsilenceAlertGroup.Register(s)
+	}
 }
 
 // helpers for converting amixr pointer types

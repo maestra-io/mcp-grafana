@@ -8,7 +8,8 @@ keywords:
   - token
   - MCP
 weight: 1
-aliases: []
+aliases:
+  - /docs/grafana-cloud/machine-learning/mcp/configure/authentication/
 ---
 
 # Authentication
@@ -54,6 +55,8 @@ volumes:
 ```
 
 Surrounding whitespace (including a trailing newline) is trimmed from the file contents. If both `GRAFANA_SERVICE_ACCOUNT_TOKEN` and `GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE` are set, the inline token takes precedence.
+
+For HTTP deployments that [select a Grafana URL per request](../command-line-flags/#select-a-grafana-url-per-request), each request must supply a token for its selected instance. The server does not reuse `GRAFANA_SERVICE_ACCOUNT_TOKEN` or the token file for that request.
 
 ## Use username and password
 

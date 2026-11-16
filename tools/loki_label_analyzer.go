@@ -7,9 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	mcpgrafana "github.com/grafana/mcp-grafana"
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
+	mcpgrafana "github.com/grafana/mcp-grafana/v2"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // The functions in this file translate the Grafana Professional Services
@@ -138,8 +137,8 @@ type GetLokiLabelCardinalityParams struct {
 	LabelNames      []string `json:"labelNames,omitempty" jsonschema:"description=Labels to measure. Omit to auto-discover."`
 	MaxLabels       int      `json:"maxLabels,omitempty" jsonschema:"description=Cap on auto-discovered labels (default 50)."`
 	MaxSampleValues int      `json:"maxSampleValues,omitempty" jsonschema:"description=Sample values per label (default 10\\, max 50)."`
-	StartRFC3339    string   `json:"startRfc3339,omitempty" jsonschema:"description=RFC3339 start (default: 1h ago)."`
-	EndRFC3339      string   `json:"endRfc3339,omitempty" jsonschema:"description=RFC3339 end (default: now)."`
+	StartRFC3339    string   `json:"startRfc3339,omitempty" jsonschema:"description=RFC3339 or relative (e.g. 'now-1h') start (default: 1h ago)."`
+	EndRFC3339      string   `json:"endRfc3339,omitempty" jsonschema:"description=RFC3339 or relative (e.g. 'now') end (default: now)."`
 }
 
 func getLokiLabelCardinality(ctx context.Context, args GetLokiLabelCardinalityParams) ([]LokiLabelCardinality, error) {
@@ -148,18 +147,18 @@ func getLokiLabelCardinality(ctx context.Context, args GetLokiLabelCardinalityPa
 		return nil, fmt.Errorf("creating Loki backend: %w", err)
 	}
 
-	start, err := parseRFC3339OrZero(args.StartRFC3339)
+	start, err := parseStartTime(args.StartRFC3339)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parsing start time: %w", err)
 	}
-	end, err := parseRFC3339OrZero(args.EndRFC3339)
+	end, err := parseEndTime(args.EndRFC3339)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parsing end time: %w", err)
 	}
 
 	labels := args.LabelNames
 	if len(labels) == 0 {
-		all, err := backend.ListLabelNames(ctx, start, end)
+		all, err := backend.ListLabelNames(ctx, "", start, end)
 		if err != nil {
 			return nil, fmt.Errorf("listing label names: %w", err)
 		}
@@ -183,7 +182,7 @@ func getLokiLabelCardinality(ctx context.Context, args GetLokiLabelCardinalityPa
 
 	out := make([]LokiLabelCardinality, 0, len(labels))
 	for _, name := range labels {
-		values, err := backend.ListLabelValues(ctx, name, start, end)
+		values, err := backend.ListLabelValues(ctx, name, "", start, end)
 		if err != nil {
 			return nil, fmt.Errorf("listing values for %q: %w", name, err)
 		}
@@ -251,8 +250,8 @@ type AuditLokiLabelStrategyParams struct {
 	DatasourceUID      string            `json:"datasourceUid,omitempty" jsonschema:"description=Live mode: Loki/VictoriaLogs datasource UID. Either this or 'labels' is required."`
 	Selector           string            `json:"selector,omitempty" jsonschema:"description=Optional LogQL selector for live stats sample."`
 	MaxLabels          int               `json:"maxLabels,omitempty" jsonschema:"description=Live-mode label cap (default 50)."`
-	StartRFC3339       string            `json:"startRfc3339,omitempty" jsonschema:"description=RFC3339 start (default: 1h ago)."`
-	EndRFC3339         string            `json:"endRfc3339,omitempty" jsonschema:"description=RFC3339 end (default: now)."`
+	StartRFC3339       string            `json:"startRfc3339,omitempty" jsonschema:"description=RFC3339 or relative (e.g. 'now-1h') start (default: 1h ago)."`
+	EndRFC3339         string            `json:"endRfc3339,omitempty" jsonschema:"description=RFC3339 or relative (e.g. 'now') end (default: now)."`
 	Labels             []LabelDescriptor `json:"labels,omitempty" jsonschema:"description=Static mode: caller-supplied label set."`
 	ExpectedBaseLabels []string          `json:"expectedBaseLabels,omitempty" jsonschema:"description=Override the default recommended base labels."`
 }
@@ -361,8 +360,8 @@ func gatherLiveDescriptors(ctx context.Context, args AuditLokiLabelStrategyParam
 	if args.Selector != "" {
 		backend, err := lokiBackendForDatasource(ctx, args.DatasourceUID)
 		if err == nil {
-			start, _ := parseRFC3339OrZero(args.StartRFC3339)
-			end, _ := parseRFC3339OrZero(args.EndRFC3339)
+			start, _ := parseStartTime(args.StartRFC3339)
+			end, _ := parseEndTime(args.EndRFC3339)
 			if s, err := backend.QueryStats(ctx, args.Selector, start, end); err == nil {
 				stats = s
 			}
@@ -757,8 +756,8 @@ type DiagnoseLokiQueryPerformanceParams struct {
 	DatasourceUID string           `json:"datasourceUid,omitempty" jsonschema:"description=Datasource UID for live stats."`
 	LogQL         string           `json:"logql,omitempty" jsonschema:"description=Label-only selector for live stats."`
 	Metrics       QueryPerfMetrics `json:"metrics,omitempty" jsonschema:"description=Runtime metrics from metrics.go."`
-	StartRFC3339  string           `json:"startRfc3339,omitempty" jsonschema:"description=RFC3339 start."`
-	EndRFC3339    string           `json:"endRfc3339,omitempty" jsonschema:"description=RFC3339 end."`
+	StartRFC3339  string           `json:"startRfc3339,omitempty" jsonschema:"description=RFC3339 or relative (e.g. 'now-1h') start."`
+	EndRFC3339    string           `json:"endRfc3339,omitempty" jsonschema:"description=RFC3339 or relative (e.g. 'now') end."`
 }
 
 // QueryPerfDiagnosis is the structured output.
@@ -773,8 +772,8 @@ func diagnoseLokiQueryPerformance(ctx context.Context, args DiagnoseLokiQueryPer
 	if args.DatasourceUID != "" && args.LogQL != "" {
 		backend, err := lokiBackendForDatasource(ctx, args.DatasourceUID)
 		if err == nil {
-			start, _ := parseRFC3339OrZero(args.StartRFC3339)
-			end, _ := parseRFC3339OrZero(args.EndRFC3339)
+			start, _ := parseStartTime(args.StartRFC3339)
+			end, _ := parseEndTime(args.EndRFC3339)
 			s, statsErr := backend.QueryStats(ctx, args.LogQL, start, end)
 			if statsErr == nil {
 				stats = s
@@ -926,7 +925,7 @@ func buildPerfSummary(findings []QueryPerfFinding, stats *Stats) string {
 
 // AddLokiLabelAnalyzerTools registers the label-analyzer tool set.
 // AddLokiTools calls this so the standard Loki bundle includes them.
-func AddLokiLabelAnalyzerTools(s *server.MCPServer) {
+func AddLokiLabelAnalyzerTools(s *mcp.Server) {
 	AnalyzeLokiLabels.Register(s)
 }
 
@@ -962,6 +961,8 @@ func analyzeLokiLabels(ctx context.Context, args AnalyzeLokiLabelsParams) (*Anal
 	if args.DatasourceUID == "" && len(args.Labels) == 0 {
 		return nil, fmt.Errorf("either datasourceUid or labels must be supplied")
 	}
+	// VictoriaLogs reads a missing start as all of retention, so pin the window here.
+	args.StartRFC3339, args.EndRFC3339 = getDefaultTimeRange(args.StartRFC3339, args.EndRFC3339)
 
 	audit, err := auditLokiLabelStrategy(ctx, AuditLokiLabelStrategyParams{
 		DatasourceUID:      args.DatasourceUID,
@@ -1008,7 +1009,10 @@ var AnalyzeLokiLabels = mcpgrafana.MustTool(
 	"analyze_loki_labels",
 	"Audits a Loki label strategy and optionally diagnoses query performance. Returns per-label verdicts, missing base labels, normalisation issues, and a recommended set. Pass datasourceUid for live cardinality or labels for static scoring; both may be combined.",
 	analyzeLokiLabels,
-	mcp.WithTitleAnnotation("Analyze Loki label strategy"),
-	mcp.WithIdempotentHintAnnotation(true),
-	mcp.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithTitleAnnotation("Analyze Loki label strategy"),
+	mcpgrafana.WithIdempotentHintAnnotation(true),
+	mcpgrafana.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithDestructiveHintAnnotation(false),
+	mcpgrafana.WithOpenWorldHintAnnotation(false),
+	mcpgrafana.RequiresPermissions(datasourceQuery...),
 )

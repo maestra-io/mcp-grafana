@@ -6,12 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/grafana/grafana-openapi-client-go/models"
-	mcpgrafana "github.com/grafana/mcp-grafana"
+	mcpgrafana "github.com/grafana/mcp-grafana/v2"
+	"github.com/grafana/mcp-grafana/v2/internal/datasource"
 )
 
 const (
@@ -21,14 +25,21 @@ const (
 	// MaxSearchLimit is the maximum number of documents that can be requested
 	MaxSearchLimit = 100
 
+	// Default time field to use when not configured explicitly in a datasource
+	defaultTimeField = "@timestamp"
+
+	// Default log message field to use when not configured explicitly in a datasource
+	defaultLogMessageField = "message"
+
 	elasticsearchDatasourceType = "elasticsearch"
 	openSearchDatasourceType    = "grafana-opensearch-datasource"
 )
 
-// ElasticsearchDocument represents a single document from search results
+// ElasticsearchDocument represents a single document from search results.
+// Index and ID are empty in compact results.
 type ElasticsearchDocument struct {
-	Index     string                 `json:"_index"`
-	ID        string                 `json:"_id"`
+	Index     string                 `json:"_index,omitempty"`
+	ID        string                 `json:"_id,omitempty"`
 	Score     *float64               `json:"_score,omitempty"`
 	Source    map[string]interface{} `json:"_source"`
 	Fields    map[string]interface{} `json:"fields,omitempty"`
@@ -39,12 +50,32 @@ type ElasticsearchDocument struct {
 // datasource types, which both support Lucene query syntax.
 type esBackend interface {
 	// Search executes a search query and returns matching documents.
-	Search(ctx context.Context, index, query string, startTime, endTime *time.Time, limit int) ([]ElasticsearchDocument, error)
+	Search(ctx context.Context, index, query string, startTime, endTime time.Time, limit int) ([]ElasticsearchDocument, error)
+	// logFields returns the log message and level fields configured on the datasource.
+	logFields() esLogFields
+}
+
+// esLogFields names the source fields that hold a log line's message and
+// level, as configured on the datasource for the logs view in Explore.
+type esLogFields struct {
+	message string
+	level   string
+}
+
+// names returns the configured field names, skipping unset ones.
+func (f esLogFields) names() []string {
+	var names []string
+	for _, name := range []string{f.message, f.level} {
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 // esBackendForDatasource looks up the datasource type and returns the appropriate backend.
 func esBackendForDatasource(ctx context.Context, uid string) (esBackend, error) {
-	ds, err := getDatasourceByUID(ctx, GetDatasourceByUIDParams{UID: uid})
+	ds, err := datasource.ByUID(ctx, uid)
 	if err != nil {
 		return nil, err
 	}
@@ -59,15 +90,126 @@ func esBackendForDatasource(ctx context.Context, uid string) (esBackend, error) 
 	}
 }
 
-// elasticsearchBackend handles queries to an Elasticsearch datasource via Grafana proxy.
+// timeFieldFromDataSource reads the configured time field from datasource jsonData.
+func timeFieldFromDataSource(ds *models.DataSource) string {
+	if ds == nil {
+		return defaultTimeField
+	}
+	jsonData, ok := ds.JSONData.(map[string]interface{})
+	if !ok {
+		return defaultTimeField
+	}
+	if tf, ok := jsonData["timeField"].(string); ok && tf != "" {
+		return tf
+	}
+	return defaultTimeField
+}
+
+// logFieldsFromDataSource reads the configured log message and level fields
+// from datasource jsonData. The message field defaults to "message"; the
+// level field has no default.
+func logFieldsFromDataSource(ds *models.DataSource) esLogFields {
+	fields := esLogFields{message: defaultLogMessageField}
+	if ds == nil {
+		return fields
+	}
+	jsonData, ok := ds.JSONData.(map[string]interface{})
+	if !ok {
+		return fields
+	}
+	if f, ok := jsonData["logMessageField"].(string); ok && f != "" {
+		fields.message = f
+	}
+	if f, ok := jsonData["logLevelField"].(string); ok {
+		fields.level = f
+	}
+	return fields
+}
+
+// selectSourceFields returns the given fields of a document's source, keyed
+// by the requested name. A name with dots matches a key of that name or a
+// path through nested objects, so "kubernetes.pod_name" finds both
+// {"kubernetes.pod_name": ...} and {"kubernetes": {"pod_name": ...}}. Values
+// found in the objects of an array are collected into one array, as
+// Elasticsearch's fields API returns them. Fields the document doesn't have
+// are left out.
+func selectSourceFields(source map[string]interface{}, fields []string) map[string]interface{} {
+	selected := make(map[string]interface{}, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		if v, ok := lookupSourceField(source, field); ok {
+			selected[field] = v
+		}
+	}
+	return selected
+}
+
+func lookupSourceField(source map[string]interface{}, field string) (interface{}, bool) {
+	if v, ok := source[field]; ok {
+		return v, true
+	}
+	for i := strings.IndexByte(field, '.'); i >= 0; {
+		if v, ok := lookupNestedField(source[field[:i]], field[i+1:]); ok {
+			return v, true
+		}
+		next := strings.IndexByte(field[i+1:], '.')
+		if next < 0 {
+			break
+		}
+		i += next + 1
+	}
+	return nil, false
+}
+
+// lookupNestedField looks a field up in a nested object, or in every object
+// of an array, flattening the values found there into one array.
+func lookupNestedField(value interface{}, field string) (interface{}, bool) {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		return lookupSourceField(v, field)
+	case []interface{}:
+		var values []interface{}
+		for _, item := range v {
+			found, ok := lookupNestedField(item, field)
+			if !ok {
+				continue
+			}
+			if arr, isArr := found.([]interface{}); isArr {
+				values = append(values, arr...)
+			} else {
+				values = append(values, found)
+			}
+		}
+		return values, len(values) > 0
+	}
+	return nil, false
+}
+
+// elasticsearchBackend handles queries to an Elasticsearch datasource. Queries
+// go through Grafana's /api/ds/query endpoint, and so through its query
+// service, when the installed plugin supports them there; otherwise they go
+// through the datasource proxy.
 type elasticsearchBackend struct {
 	httpClient *http.Client
 	baseURL    string
+	grafanaURL string
+	dsUID      string
+	timeField  string
+	logs       esLogFields
+	// luceneViaDSQuery and dslViaDSQuery record whether the plugin honours
+	// the per-query index (12.6.0) and accepts raw DSL queries without a
+	// feature toggle (12.7.0) on /api/ds/query.
+	luceneViaDSQuery bool
+	dslViaDSQuery    bool
 }
 
 func newElasticsearchBackend(ctx context.Context, ds *models.DataSource) (*elasticsearchBackend, error) {
 	cfg := mcpgrafana.GrafanaConfigFromContext(ctx)
-	url := fmt.Sprintf("%s/api/datasources/proxy/uid/%s", strings.TrimRight(cfg.URL, "/"), ds.UID)
+	grafanaURL := strings.TrimRight(cfg.URL, "/")
+	url := fmt.Sprintf("%s/api/datasources/proxy/uid/%s", grafanaURL, ds.UID)
 
 	transport, err := mcpgrafana.BuildTransport(&cfg, nil)
 	if err != nil {
@@ -75,24 +217,97 @@ func newElasticsearchBackend(ctx context.Context, ds *models.DataSource) (*elast
 	}
 
 	client := &http.Client{
-		Transport: transport,
+		Transport:     transport,
+		CheckRedirect: refuseRedirect,
 	}
 
+	major, minor := elasticsearchPluginVersion(ctx, client, grafanaURL)
 	return &elasticsearchBackend{
-		httpClient: client,
-		baseURL:    url,
+		httpClient:       client,
+		baseURL:          url,
+		grafanaURL:       grafanaURL,
+		dsUID:            ds.UID,
+		timeField:        timeFieldFromDataSource(ds),
+		logs:             logFieldsFromDataSource(ds),
+		luceneViaDSQuery: major > 12 || major == 12 && minor >= 6,
+		dslViaDSQuery:    major > 12 || major == 12 && minor >= 7,
 	}, nil
 }
 
-// buildURL constructs a full URL for an Elasticsearch API endpoint
-func (b *elasticsearchBackend) buildURL(urlPath string) string {
-	fullURL := b.baseURL
-	if !strings.HasSuffix(fullURL, "/") && !strings.HasPrefix(urlPath, "/") {
-		fullURL += "/"
-	} else if strings.HasSuffix(fullURL, "/") && strings.HasPrefix(urlPath, "/") {
-		urlPath = strings.TrimPrefix(urlPath, "/")
+func (b *elasticsearchBackend) logFields() esLogFields {
+	return b.logs
+}
+
+// esPluginVersions caches elasticsearchPluginVersion results per Grafana
+// instance and credential (see datasource.ScopedKey). Lookups that fail are
+// cached briefly so they don't add a round trip to every call.
+var esPluginVersions sync.Map
+
+type esPluginVersion struct {
+	major, minor int
+	expires      time.Time
+}
+
+const (
+	esPluginVersionTTL       = time.Hour
+	esPluginVersionFailedTTL = time.Minute
+	esPluginVersionTimeout   = 10 * time.Second
+)
+
+// elasticsearchPluginVersion returns the major and minor version of the
+// installed Elasticsearch plugin. Grafana up to 12.4 bundles the plugin with
+// the Grafana version, so those report versions below 12.6 too. If the
+// version can't be read, the plugin is assumed to be new enough, so a token
+// without access to the settings gets Grafana's error from /api/ds/query
+// rather than a silent fallback to the proxy.
+func elasticsearchPluginVersion(ctx context.Context, client *http.Client, grafanaURL string) (major, minor int) {
+	key := datasource.ScopedKey(ctx, "es-plugin-version", "")
+	if v, ok := esPluginVersions.Load(key); ok && time.Now().Before(v.(esPluginVersion).expires) {
+		return v.(esPluginVersion).major, v.(esPluginVersion).minor
 	}
-	return fullURL + urlPath
+	lookupCtx, cancel := context.WithTimeout(ctx, esPluginVersionTimeout)
+	defer cancel()
+	major, minor, ok := fetchElasticsearchPluginVersion(lookupCtx, client, grafanaURL)
+	if !ok {
+		major, minor = math.MaxInt, 0
+	}
+	if ctx.Err() != nil {
+		// The caller gave up, which says nothing about the lookup for others.
+		return major, minor
+	}
+	ttl := esPluginVersionTTL
+	if !ok {
+		ttl = esPluginVersionFailedTTL
+	}
+	esPluginVersions.Store(key, esPluginVersion{major: major, minor: minor, expires: time.Now().Add(ttl)})
+	return major, minor
+}
+
+// fetchElasticsearchPluginVersion reads the plugin version from Grafana.
+// ok is false when the settings can't be read; a version that doesn't parse,
+// such as the empty one Grafana 8 reports, is a successful zero result.
+func fetchElasticsearchPluginVersion(ctx context.Context, client *http.Client, grafanaURL string) (major, minor int, ok bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, grafanaURL+"/api/plugins/"+elasticsearchDatasourceType+"/settings", nil)
+	if err != nil {
+		return 0, 0, false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var settings struct {
+		Info struct {
+			Version string `json:"version"`
+		} `json:"info"`
+	}
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&settings) != nil {
+		return 0, 0, false
+	}
+	if _, err := fmt.Sscanf(settings.Info.Version, "%d.%d", &major, &minor); err != nil {
+		return 0, 0, true
+	}
+	return major, minor, true
 }
 
 // elasticsearchResponse represents a generic Elasticsearch search response
@@ -121,10 +336,123 @@ type msearchResponse struct {
 
 // Search performs a search query against Elasticsearch using the _msearch API.
 // Grafana's datasource proxy only allows POST requests to /_msearch for Elasticsearch.
-func (b *elasticsearchBackend) Search(ctx context.Context, index, query string, startTime, endTime *time.Time, limit int) ([]ElasticsearchDocument, error) {
-	searchQuery := buildElasticsearchQuery(query, startTime, endTime, limit)
+func (b *elasticsearchBackend) Search(ctx context.Context, index, query string, startTime, endTime time.Time, limit int) ([]ElasticsearchDocument, error) {
+	sq := esSearchQuery{
+		query:     query,
+		startTime: startTime,
+		endTime:   endTime,
+		size:      limit,
+		timeField: b.timeField,
+	}
+	isDSL := json.Unmarshal([]byte(query), &map[string]interface{}{}) == nil
+	if isDSL && b.dslViaDSQuery || !isDSL && b.luceneViaDSQuery {
+		return b.searchViaDSQuery(ctx, index, sq, isDSL)
+	}
+	docs, err := executeMSearch(ctx, b.httpClient, buildURL(b.baseURL, "/_msearch"), index, sq.build(), b.timeField)
+	if err != nil {
+		return nil, err
+	}
+	for i := range docs {
+		if docs[i].Timestamp == "" {
+			// The time field is a nested path or holds an array of values.
+			docs[i].Timestamp = sourceTimestamp(docs[i].Source, b.timeField)
+		}
+	}
+	return docs, nil
+}
 
-	// Build NDJSON payload for _msearch API
+// searchViaDSQuery runs a raw_document query through Grafana's /api/ds/query
+// endpoint. Query DSL is sent as a raw DSL query holding the same search body
+// the proxy path sends; the plugin uses that body verbatim.
+func (b *elasticsearchBackend) searchViaDSQuery(ctx context.Context, index string, sq esSearchQuery, isDSL bool) ([]ElasticsearchDocument, error) {
+	from, to := sq.startTime, sq.endTime
+	if to.IsZero() {
+		to = time.Now()
+	}
+	if from.IsZero() {
+		from = to.Add(-10 * 365 * 24 * time.Hour)
+	}
+
+	q := map[string]interface{}{
+		"refId":      "A",
+		"datasource": map[string]string{"uid": b.dsUID, "type": elasticsearchDatasourceType},
+		"index":      index,
+		"query":      sq.query,
+		"metrics": []map[string]interface{}{
+			{"id": "1", "type": "raw_document", "settings": map[string]string{"size": strconv.Itoa(sq.size)}},
+		},
+		"bucketAggs": []interface{}{},
+	}
+	if isDSL {
+		body, err := json.Marshal(sq.build())
+		if err != nil {
+			return nil, fmt.Errorf("marshalling query: %w", err)
+		}
+		q["queryType"] = "dsl"
+		q["query"] = string(body)
+	}
+
+	resp, err := doDSQueryWithLimit(ctx, b.httpClient, b.grafanaURL, dsQueryPayload(from, to, q), rawDocumentResponseLimit)
+	if err != nil {
+		return nil, fmt.Errorf("querying Elasticsearch: %w", err)
+	}
+	r, ok := resp.Responses["A"]
+	if !ok {
+		return nil, fmt.Errorf("no result found for refId A")
+	}
+	if r.Error != nil {
+		return nil, fmt.Errorf("elasticsearch query error: %s", r.Error.Error())
+	}
+	docs, err := framesToDocuments(r.Frames, b.timeField, true)
+	if err != nil {
+		return nil, err
+	}
+	for i := range docs {
+		// The plugin adds the hit's sort values (always an array) and
+		// highlight (null, as we never ask for highlighting) next to the
+		// source fields, and source fields of the same name overwrite them.
+		// So only values of that shape can be the plugin's. ponytail: a source
+		// field that is an array named sort or null named highlight is
+		// dropped too; the frame can't tell them apart.
+		if _, ok := docs[i].Source["sort"].([]interface{}); ok {
+			delete(docs[i].Source, "sort")
+		}
+		if v, ok := docs[i].Source["highlight"]; ok && v == nil {
+			delete(docs[i].Source, "highlight")
+		}
+	}
+	return docs, nil
+}
+
+// sourceTimestamp formats the value of a document's time field, which may be
+// a nested path such as "event.created" and may hold an array of values, of
+// which the first is used.
+func sourceTimestamp(source map[string]interface{}, timeField string) string {
+	v, _ := lookupSourceField(source, timeField)
+	if arr, ok := v.([]interface{}); ok {
+		if len(arr) == 0 {
+			return ""
+		}
+		v = arr[0]
+	}
+	return esTimestamp(v)
+}
+
+// esTimestamp formats a document's time field value: strings are kept as
+// they are, and epoch milliseconds become RFC3339.
+func esTimestamp(v interface{}) string {
+	switch ts := v.(type) {
+	case string:
+		return ts
+	case float64:
+		return time.UnixMilli(int64(ts)).UTC().Format(time.RFC3339Nano)
+	}
+	return ""
+}
+
+// executeMSearch runs an Elasticsearch-compatible _msearch request and converts hits to documents.
+func executeMSearch(ctx context.Context, client *http.Client, url string, index string,
+	searchQuery map[string]interface{}, timeField string) ([]ElasticsearchDocument, error) {
 	header := map[string]interface{}{
 		"index":              index,
 		"ignore_unavailable": true,
@@ -146,15 +474,13 @@ func (b *elasticsearchBackend) Search(ctx context.Context, index, query string, 
 	payload.Write(queryBytes)
 	payload.WriteByte('\n')
 
-	fullURL := b.buildURL("/_msearch")
-
-	req, err := http.NewRequestWithContext(ctx, "POST", fullURL, &payload)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, &payload)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-ndjson")
 
-	resp, err := b.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("executing request: %w", err)
 	}
@@ -202,14 +528,7 @@ func (b *elasticsearchBackend) Search(ctx context.Context, index, query string, 
 		}
 		if source, ok := hit["_source"].(map[string]interface{}); ok {
 			doc.Source = source
-			switch ts := source["@timestamp"].(type) {
-			case string:
-				doc.Timestamp = ts
-			case float64:
-				sec := int64(ts) / 1000
-				nsec := (int64(ts) % 1000) * int64(time.Millisecond)
-				doc.Timestamp = time.Unix(sec, nsec).UTC().Format(time.RFC3339Nano)
-			}
+			doc.Timestamp = esTimestamp(source[timeField])
 		}
 		if fields, ok := hit["fields"].(map[string]interface{}); ok {
 			doc.Fields = fields
@@ -221,64 +540,95 @@ func (b *elasticsearchBackend) Search(ctx context.Context, index, query string, 
 	return documents, nil
 }
 
-// buildElasticsearchQuery constructs an Elasticsearch query DSL JSON object
-func buildElasticsearchQuery(query string, startTime, endTime *time.Time, size int) map[string]interface{} {
+// esSearchQuery collects fields to build an Elasticsearch query DSL JSON
+type esSearchQuery struct {
+	query     string
+	startTime time.Time
+	endTime   time.Time
+	size      int
+	timeField string
+	// sortFormat optionally sets the "format" on the time field sort clause,
+	// e.g. "epoch_nanos_int" for Quickwit nanosecond timestamps.
+	sortFormat string
+}
+
+// build constructs the Elasticsearch query DSL JSON
+func (q esSearchQuery) build() map[string]interface{} {
 	esQuery := map[string]interface{}{
-		"size": size,
+		"size": q.size,
 		"sort": []map[string]interface{}{
 			{
-				"@timestamp": map[string]string{
-					"order": "desc",
-				},
+				q.timeField: q.buildSortField(),
 			},
 		},
+		"query": q.buildQueryClause(),
 	}
 
-	var queryClause map[string]interface{}
+	return esQuery
+}
 
-	if startTime != nil || endTime != nil || query != "" {
-		mustClauses := []map[string]interface{}{}
+func (q esSearchQuery) buildSortField() map[string]string {
+	sortField := map[string]string{
+		"order": "desc",
+	}
+	if q.sortFormat != "" {
+		sortField["format"] = q.sortFormat
+	}
+	return sortField
+}
 
-		if startTime != nil || endTime != nil {
-			rangeQuery := map[string]interface{}{
-				"@timestamp": map[string]interface{}{},
-			}
-			if startTime != nil {
-				rangeQuery["@timestamp"].(map[string]interface{})["gte"] = startTime.Format(time.RFC3339)
-			}
-			if endTime != nil {
-				rangeQuery["@timestamp"].(map[string]interface{})["lte"] = endTime.Format(time.RFC3339)
-			}
-			mustClauses = append(mustClauses, map[string]interface{}{
-				"range": rangeQuery,
-			})
-		}
-
-		if query != "" {
-			var parsedQuery map[string]interface{}
-			if err := json.Unmarshal([]byte(query), &parsedQuery); err == nil {
-				mustClauses = append(mustClauses, parsedQuery)
-			} else {
-				mustClauses = append(mustClauses, map[string]interface{}{
-					"query_string": map[string]interface{}{
-						"query": query,
-					},
-				})
-			}
-		}
-
-		queryClause = map[string]interface{}{
-			"bool": map[string]interface{}{
-				"must": mustClauses,
-			},
-		}
-	} else {
-		queryClause = map[string]interface{}{
+func (q esSearchQuery) buildQueryClause() map[string]interface{} {
+	if q.startTime.IsZero() && q.endTime.IsZero() && q.query == "" {
+		return map[string]interface{}{
 			"match_all": map[string]interface{}{},
 		}
 	}
 
-	esQuery["query"] = queryClause
+	mustClauses := []map[string]interface{}{}
 
-	return esQuery
+	if rangeClause := q.buildRangeClause(); rangeClause != nil {
+		mustClauses = append(mustClauses, rangeClause)
+	}
+
+	if q.query != "" {
+		var parsedQuery map[string]interface{}
+		var textClause map[string]interface{}
+		if err := json.Unmarshal([]byte(q.query), &parsedQuery); err == nil {
+			textClause = parsedQuery
+		} else {
+			textClause = map[string]interface{}{
+				"query_string": map[string]interface{}{
+					"query": q.query,
+				},
+			}
+		}
+		if len(mustClauses) == 0 {
+			return textClause
+		}
+		mustClauses = append(mustClauses, textClause)
+	}
+
+	return map[string]interface{}{
+		"bool": map[string]interface{}{
+			"must": mustClauses,
+		},
+	}
+}
+
+func (q esSearchQuery) buildRangeClause() map[string]interface{} {
+	if q.startTime.IsZero() && q.endTime.IsZero() {
+		return nil
+	}
+	rangeQuery := map[string]interface{}{}
+	if !q.startTime.IsZero() {
+		rangeQuery["gte"] = q.startTime.Format(time.RFC3339)
+	}
+	if !q.endTime.IsZero() {
+		rangeQuery["lte"] = q.endTime.Format(time.RFC3339)
+	}
+	return map[string]interface{}{
+		"range": map[string]interface{}{
+			q.timeField: rangeQuery,
+		},
+	}
 }

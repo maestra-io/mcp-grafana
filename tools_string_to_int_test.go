@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -204,13 +204,8 @@ func TestConvertToolWithStringToIntConversion(t *testing.T) {
 	_, handler, err := ConvertTool("test_int_tool", "A test tool with int params", testIntHandler)
 	require.NoError(t, err)
 
-	makeRequest := func(args map[string]any) mcp.CallToolRequest {
-		return mcp.CallToolRequest{
-			Params: mcp.CallToolParams{
-				Name:      "test_int_tool",
-				Arguments: args,
-			},
-		}
+	makeRequest := func(args map[string]any) *mcp.CallToolRequest {
+		return newCallToolRequest("test_int_tool", args)
 	}
 
 	tests := []struct {
@@ -466,10 +461,11 @@ func TestUnmarshalWithAllIntegerTypes(t *testing.T) {
 
 func TestUnmarshalWithStringToSliceCoercion(t *testing.T) {
 	type params struct {
-		Tags   []string `json:"tags,omitempty"`
-		States []string `json:"states,omitempty"`
-		Name   string   `json:"name"`
-		Count  int      `json:"count"`
+		Tags     []string  `json:"tags,omitempty"`
+		States   []string  `json:"states,omitempty"`
+		Replaces *[]string `json:"replaces,omitempty"`
+		Name     string    `json:"name"`
+		Count    int       `json:"count"`
 	}
 
 	t.Run("accepts array as-is", func(t *testing.T) {
@@ -500,6 +496,26 @@ func TestUnmarshalWithStringToSliceCoercion(t *testing.T) {
 		var got params
 		require.NoError(t, unmarshalWithIntConversion([]byte(data), &got))
 		assert.Nil(t, got.Tags)
+		assert.Nil(t, got.Replaces)
+	})
+
+	// A parameter is declared *[]string when an omitted list and an explicitly
+	// empty one mean different things, which is a reason to reach for the pointer
+	// and not a reason to lose the coercion.
+	t.Run("coerces a string into a pointer-to-array field", func(t *testing.T) {
+		data := `{"replaces":"single","name":"test","count":1}`
+		var got params
+		require.NoError(t, unmarshalWithIntConversion([]byte(data), &got))
+		require.NotNil(t, got.Replaces)
+		assert.Equal(t, []string{"single"}, *got.Replaces)
+	})
+
+	t.Run("an explicitly empty pointer-to-array stays empty rather than becoming nil", func(t *testing.T) {
+		data := `{"replaces":[],"name":"test","count":1}`
+		var got params
+		require.NoError(t, unmarshalWithIntConversion([]byte(data), &got))
+		require.NotNil(t, got.Replaces)
+		assert.Empty(t, *got.Replaces)
 	})
 
 	t.Run("handles embedded struct with string slice", func(t *testing.T) {
@@ -529,13 +545,8 @@ func TestUnmarshalWithStringToSliceCoercion(t *testing.T) {
 		_, h, err := ConvertTool("test", "test", handler)
 		require.NoError(t, err)
 
-		result, err := h(context.Background(), mcp.CallToolRequest{
-			Params: mcp.CallToolParams{
-				Name:      "test",
-				Arguments: map[string]any{"labels": "test"},
-			},
-		})
+		result, err := h(context.Background(), newCallToolRequest("test", map[string]any{"labels": "test"}))
 		require.NoError(t, err)
-		assert.Equal(t, "ok", result.Content[0].(mcp.TextContent).Text)
+		assert.Equal(t, "ok", result.Content[0].(*mcp.TextContent).Text)
 	})
 }

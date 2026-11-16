@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	mcpgrafana "github.com/grafana/mcp-grafana"
+	mcpgrafana "github.com/grafana/mcp-grafana/v2"
 )
 
 // oncallProxyRequestTimeout bounds a single IRM-proxy HTTP call so a request
@@ -266,15 +266,9 @@ func proxyListAlertGroups(ctx context.Context, args ListAlertGroupsParams) ([]*O
 		path += "?" + params.Encode()
 	}
 
-	var internal []onCallAlertGroupInternal
-	var err2 error
-	if args.Page > 0 {
-		internal, err2 = fetchSinglePage[onCallAlertGroupInternal](ctx, client, path)
-	} else {
-		internal, err2 = fetchPaginated[onCallAlertGroupInternal](ctx, client, path)
-	}
-	if err2 != nil {
-		return nil, fmt.Errorf("listing alert groups: %w", err2)
+	internal, err := fetchSinglePage[onCallAlertGroupInternal](ctx, client, path)
+	if err != nil {
+		return nil, fmt.Errorf("listing alert groups: %w", err)
 	}
 
 	result := make([]*OnCallAlertGroup, 0, len(internal))
@@ -295,6 +289,32 @@ func proxyGetAlertGroup(ctx context.Context, id string) (*OnCallAlertGroup, erro
 		return nil, fmt.Errorf("getting alert group %s: %w", id, err)
 	}
 	return internal.toOnCallAlertGroup(), nil
+}
+
+// proxyUpdateAlertGroup posts an alert group state action through the IRM
+// plugin proxy. It is the OBO counterpart to amixrUpdateAlertGroup.
+func proxyUpdateAlertGroup(ctx context.Context, id, action string) error {
+	client, err := newOncallProxyClient(ctx)
+	if err != nil {
+		return fmt.Errorf("creating proxy client: %w", err)
+	}
+
+	path := fmt.Sprintf(
+		"%s%s/%s/",
+		proxyAlertGroupsPath,
+		url.PathEscape(id),
+		url.PathEscape(action),
+	)
+	resp, err := client.doRequest(ctx, http.MethodPost, path, nil)
+	if err != nil {
+		return fmt.Errorf("%s alert group %s: %w", action, id, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("%s alert group %s: %w", action, id, handleProxyErrorResponse(resp))
+	}
+	return nil
 }
 
 func proxyListSchedules(ctx context.Context, args ListOnCallSchedulesParams) ([]*ScheduleSummary, error) {
@@ -323,12 +343,7 @@ func proxyListSchedules(ctx context.Context, args ListOnCallSchedulesParams) ([]
 		path += "?" + params.Encode()
 	}
 
-	var schedules []onCallScheduleInternal
-	if args.Page > 0 {
-		schedules, err = fetchSinglePage[onCallScheduleInternal](ctx, client, path)
-	} else {
-		schedules, err = fetchPaginated[onCallScheduleInternal](ctx, client, path)
-	}
+	schedules, err := fetchSinglePage[onCallScheduleInternal](ctx, client, path)
 	if err != nil {
 		return nil, fmt.Errorf("listing schedules: %w", err)
 	}
@@ -395,10 +410,11 @@ func proxyListUsers(ctx context.Context, args ListOnCallUsersParams) ([]*OnCallU
 	}
 
 	var internal []onCallUserInternal
-	if args.Page > 0 {
-		internal, err = fetchSinglePage[onCallUserInternal](ctx, client, path)
-	} else {
+	// search is fuzzy and filtered to an exact match below, so a username lookup must see every page.
+	if args.Username != "" && args.Page == 0 {
 		internal, err = fetchPaginated[onCallUserInternal](ctx, client, path)
+	} else {
+		internal, err = fetchSinglePage[onCallUserInternal](ctx, client, path)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("listing users: %w", err)
@@ -430,12 +446,7 @@ func proxyListTeams(ctx context.Context, args ListOnCallTeamsParams) ([]*OnCallT
 		path += "?" + params.Encode()
 	}
 
-	var internal []onCallTeamInternal
-	if args.Page > 0 {
-		internal, err = fetchSinglePage[onCallTeamInternal](ctx, client, path)
-	} else {
-		internal, err = fetchPaginated[onCallTeamInternal](ctx, client, path)
-	}
+	internal, err := fetchSinglePage[onCallTeamInternal](ctx, client, path)
 	if err != nil {
 		return nil, fmt.Errorf("listing teams: %w", err)
 	}
@@ -478,7 +489,8 @@ func proxyGetCurrentOnCallUsers(ctx context.Context, scheduleID string) (*Curren
 }
 
 // extractUserIDs extracts user ID strings from the on_call_now field,
-// which can be []string or []any depending on the API.
+// which can be []string or []any depending on the API. Each []any entry may
+// itself be a plain ID string or a user object with a "pk" field.
 func extractUserIDs(onCallNow any) []string {
 	switch v := onCallNow.(type) {
 	case []string:
@@ -486,8 +498,13 @@ func extractUserIDs(onCallNow any) []string {
 	case []any:
 		ids := make([]string, 0, len(v))
 		for _, item := range v {
-			if s, ok := item.(string); ok {
-				ids = append(ids, s)
+			switch t := item.(type) {
+			case string:
+				ids = append(ids, t)
+			case map[string]any:
+				if pk, ok := t["pk"].(string); ok {
+					ids = append(ids, pk)
+				}
 			}
 		}
 		return ids

@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
-	"sync"
+	"strconv"
+	"strings"
 
 	"github.com/grafana/incident-go"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -19,9 +21,14 @@ import (
 
 const clientCacheMeterName = "mcp-grafana"
 
+// clientCacheMaxSize bounds the number of cached clients of each type. When
+// full, the least recently used client is evicted.
+const clientCacheMaxSize = 1000
+
 // clientCacheKey uniquely identifies a client by its credentials, target, and forwarded headers.
 type clientCacheKey struct {
 	url              string
+	overrideURL      string
 	apiKey           string
 	username         string
 	password         string
@@ -41,61 +48,40 @@ func cacheKeyFromRequest(grafanaURL, apiKey string, basicAuth *url.Userinfo, org
 		key.password, _ = basicAuth.Password()
 	}
 	if req != nil {
-		key.forwardedHeaders = forwardedHeadersDigest(forwardedHeadersFromRequest(req))
+		if overrideURL, ok := req.Context().Value(grafanaOverrideKey{}).(string); ok {
+			key.overrideURL = overrideURL
+		}
+		headers := forwardedHeadersFromRequest(req)
+		if len(headers) > 0 {
+			names := make([]string, 0, len(headers))
+			for k := range headers {
+				names = append(names, k)
+			}
+			sort.Strings(names)
+			var sb strings.Builder
+			for _, k := range names {
+				sb.WriteString(strconv.Quote(k))
+				sb.WriteByte('=')
+				sb.WriteString(strconv.Quote(headers[k]))
+				sb.WriteByte(',')
+			}
+			key.forwardedHeaders = sb.String()
+		}
 	}
 	return key
 }
 
-// forwardedHeadersDigest returns a length-prefixed SHA-256 of the sorted
-// header pairs so that the resulting string (a) cannot collide between
-// different header sets containing `=` or `,` in their values, and (b) is
-// safe to surface in debug logs (no raw header values leak).
-func forwardedHeadersDigest(headers map[string]string) string {
-	if len(headers) == 0 {
-		return ""
-	}
-	names := make([]string, 0, len(headers))
-	for k := range headers {
-		names = append(names, k)
-	}
-	sort.Strings(names)
-	h := sha256.New()
-	for _, k := range names {
-		v := headers[k]
-		_, _ = fmt.Fprintf(h, "%d:%s%d:%s", len(k), k, len(v), v)
-	}
-	return fmt.Sprintf("sha256:%x", h.Sum(nil))
-}
-
 // String returns a redacted string representation for logging.
-// forwardedHeaders is already a digest; we expose only the count of forwarded
-// headers and the digest itself to avoid leaking sensitive request data.
 func (k clientCacheKey) String() string {
 	hasKey := k.apiKey != ""
 	hasBasic := k.username != ""
-	hasFwd := k.forwardedHeaders != ""
-	return fmt.Sprintf("url=%s apiKey=%t basicAuth=%t orgID=%d forwardedHeaders=%t", k.url, hasKey, hasBasic, k.orgID, hasFwd)
+	return fmt.Sprintf("url=%s override=%t apiKey=%t basicAuth=%t orgID=%d forwardedHeaders=%t", k.url, k.overrideURL != "", hasKey, hasBasic, k.orgID, k.forwardedHeaders != "")
 }
 
-// singleflightKey returns a stable, collision-resistant key for use with
-// singleflight.Group.Do. We can't reuse String() because it intentionally
-// redacts credential values for logging — different api keys, passwords, or
-// forwarded-header digests would collapse into the same singleflight bucket
-// whenever url+orgID+presence-flags happened to match, letting one request's
-// concurrent miss receive a client built with another request's credentials.
-// The digest is a SHA-256 of the length-prefixed pairs of all key fields.
+// singleflightKey includes credentials that String intentionally redacts.
+// %#v formats the struct fields instead of calling its String method.
 func (k clientCacheKey) singleflightKey() string {
-	h := sha256.New()
-	writePart := func(s string) {
-		_, _ = fmt.Fprintf(h, "%d:%s", len(s), s)
-	}
-	writePart(k.url)
-	writePart(k.apiKey)
-	writePart(k.username)
-	writePart(k.password)
-	_, _ = fmt.Fprintf(h, "%d:", k.orgID)
-	writePart(k.forwardedHeaders)
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return fmt.Sprintf("%#v", k)
 }
 
 // clientCacheMetrics holds OTel instruments for cache observability.
@@ -106,8 +92,32 @@ type clientCacheMetrics struct {
 	size    metric.Int64Gauge   // Current number of cached clients
 }
 
-func newClientCacheMetrics() clientCacheMetrics {
-	meter := otel.GetMeterProvider().Meter(clientCacheMeterName)
+// clientCacheConfig holds configuration gathered from ClientCacheOptions.
+type clientCacheConfig struct {
+	meterProvider metric.MeterProvider
+}
+
+// ClientCacheOption configures a ClientCache created via NewClientCache.
+type ClientCacheOption func(*clientCacheConfig)
+
+// WithClientCacheMeterProvider sets the metric.MeterProvider used to create
+// the client cache's OTel instruments. If unset (or passed as nil), the
+// cache falls back to otel.GetMeterProvider(), matching the pre-existing
+// behavior. Callers embedding mcp-grafana as a library and running with a
+// non-global MeterProvider (e.g. because the process resets the global
+// provider to a noop for unrelated reasons) should pass their own provider
+// here so these metrics actually reach a scrapeable registry.
+func WithClientCacheMeterProvider(mp metric.MeterProvider) ClientCacheOption {
+	return func(c *clientCacheConfig) {
+		c.meterProvider = mp
+	}
+}
+
+func newClientCacheMetrics(mp metric.MeterProvider) clientCacheMetrics {
+	if mp == nil {
+		mp = otel.GetMeterProvider()
+	}
+	meter := mp.Meter(clientCacheMeterName)
 
 	lookups, _ := meter.Int64Counter("mcp.client_cache.lookups",
 		metric.WithDescription("Total number of client cache lookups"),
@@ -137,30 +147,50 @@ func newClientCacheMetrics() clientCacheMetrics {
 var (
 	attrClientTypeGrafana  = attribute.String("client.type", "grafana")
 	attrClientTypeIncident = attribute.String("client.type", "incident")
+	attrClientTypeK8s      = attribute.String("client.type", "kubernetes")
 )
 
 // ClientCache caches HTTP clients keyed by credentials to avoid creating
 // new transports per request. This prevents the memory leak described in
-// https://github.com/grafana/mcp-grafana/issues/682.
+// https://github.com/grafana/mcp-grafana/issues/682. Each client type is held
+// in a size-bounded LRU so the cache cannot grow without limit when many
+// distinct callers connect.
 type ClientCache struct {
-	mu              sync.RWMutex
-	grafanaClients  map[clientCacheKey]*GrafanaClient
-	incidentClients map[clientCacheKey]*incident.Client
+	grafanaClients  *lru.Cache[clientCacheKey, *GrafanaClient]
+	incidentClients *lru.Cache[clientCacheKey, *incident.Client]
+	k8sClients      *lru.Cache[clientCacheKey, *KubernetesClient]
 	metrics         clientCacheMetrics
 	sfGrafana       singleflight.Group
 	sfIncident      singleflight.Group
+	sfK8s           singleflight.Group
 	logger          *slog.Logger
 }
 
 // NewClientCache creates a new client cache.
-func NewClientCache(logger *slog.Logger) *ClientCache {
+func NewClientCache(logger *slog.Logger, opts ...ClientCacheOption) *ClientCache {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	var cfg clientCacheConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	// lru.New and lru.NewWithEvict only fail for a non-positive size.
+	grafanaClients, _ := lru.New[clientCacheKey, *GrafanaClient](clientCacheMaxSize)
+	// Evicted incident clients have their idle connections closed, as in Close.
+	// Callers still holding the client can keep using it; new connections are
+	// opened on demand.
+	incidentClients, _ := lru.NewWithEvict(clientCacheMaxSize, func(_ clientCacheKey, client *incident.Client) {
+		if client.HTTPClient != nil {
+			client.HTTPClient.CloseIdleConnections()
+		}
+	})
+	k8sClients, _ := lru.New[clientCacheKey, *KubernetesClient](clientCacheMaxSize)
 	return &ClientCache{
-		grafanaClients:  make(map[clientCacheKey]*GrafanaClient),
-		incidentClients: make(map[clientCacheKey]*incident.Client),
-		metrics:         newClientCacheMetrics(),
+		grafanaClients:  grafanaClients,
+		incidentClients: incidentClients,
+		k8sClients:      k8sClients,
+		metrics:         newClientCacheMetrics(cfg.meterProvider),
 		logger:          logger,
 	}
 }
@@ -174,43 +204,32 @@ func (c *ClientCache) GetOrCreateGrafanaClient(key clientCacheKey, createFn func
 	typeAttr := metric.WithAttributes(attrClientTypeGrafana)
 	c.metrics.lookups.Add(ctx, 1, typeAttr)
 
-	// Fast path: check with read lock
-	c.mu.RLock()
-	if client, ok := c.grafanaClients[key]; ok {
-		c.mu.RUnlock()
+	// Fast path: check the cache
+	if client, ok := c.grafanaClients.Get(key); ok {
 		c.metrics.hits.Add(ctx, 1, typeAttr)
 		return client
 	}
-	c.mu.RUnlock()
 
 	// Slow path: use singleflight to create outside the lock,
-	// deduplicating concurrent requests for the same key. We can't use the
-	// Stringer here — it redacts credential values, which would collide
-	// across different api keys/basic auth/forwarded headers.
+	// deduplicating concurrent requests for the same key.
+	// Include every credential and override policy in the grouping key. The
+	// display String method is redacted and would merge distinct callers.
 	sfKey := key.singleflightKey()
 	val, _, _ := c.sfGrafana.Do(sfKey, func() (any, error) {
 		// Double-check after winning the singleflight race
-		c.mu.RLock()
-		if client, ok := c.grafanaClients[key]; ok {
-			c.mu.RUnlock()
+		if client, ok := c.grafanaClients.Get(key); ok {
 			return client, nil
 		}
-		c.mu.RUnlock()
 
 		// Create the client without holding any lock
 		client := createFn()
 
-		// Store the result. Capture the post-insert size while still holding
-		// the lock, then unlock before logging so synchronous log writes
-		// don't queue cache traffic behind us.
-		c.mu.Lock()
-		c.grafanaClients[key] = client
+		// Store the result
+		c.grafanaClients.Add(key, client)
 		c.metrics.misses.Add(ctx, 1, typeAttr)
-		size := len(c.grafanaClients)
-		c.metrics.size.Record(ctx, int64(size), typeAttr)
-		c.mu.Unlock()
+		c.metrics.size.Record(ctx, int64(c.grafanaClients.Len()), typeAttr)
+		c.logger.Debug("Cached new Grafana client", "key", key, "cache_size", c.grafanaClients.Len())
 
-		c.logger.Debug("Cached new Grafana client", "key", key, "cache_size", size)
 		return client, nil
 	})
 
@@ -226,70 +245,91 @@ func (c *ClientCache) GetOrCreateIncidentClient(key clientCacheKey, createFn fun
 	typeAttr := metric.WithAttributes(attrClientTypeIncident)
 	c.metrics.lookups.Add(ctx, 1, typeAttr)
 
-	// Fast path: check with read lock
-	c.mu.RLock()
-	if client, ok := c.incidentClients[key]; ok {
-		c.mu.RUnlock()
+	// Fast path: check the cache
+	if client, ok := c.incidentClients.Get(key); ok {
 		c.metrics.hits.Add(ctx, 1, typeAttr)
 		return client
 	}
-	c.mu.RUnlock()
 
 	// Slow path: use singleflight to create outside the lock
 	sfKey := key.singleflightKey()
 	val, _, _ := c.sfIncident.Do(sfKey, func() (any, error) {
-		c.mu.RLock()
-		if client, ok := c.incidentClients[key]; ok {
-			c.mu.RUnlock()
+		if client, ok := c.incidentClients.Get(key); ok {
 			return client, nil
 		}
-		c.mu.RUnlock()
 
 		client := createFn()
 
-		c.mu.Lock()
-		c.incidentClients[key] = client
+		c.incidentClients.Add(key, client)
 		c.metrics.misses.Add(ctx, 1, typeAttr)
-		size := len(c.incidentClients)
-		c.metrics.size.Record(ctx, int64(size), typeAttr)
-		c.mu.Unlock()
+		c.metrics.size.Record(ctx, int64(c.incidentClients.Len()), typeAttr)
+		c.logger.Debug("Cached new incident client", "key", key, "cache_size", c.incidentClients.Len())
 
-		c.logger.Debug("Cached new incident client", "key", key, "cache_size", size)
 		return client, nil
 	})
 
 	return val.(*incident.Client)
 }
 
+// GetOrCreateK8sClient returns a cached Kubernetes client for the given key,
+// or creates one using createFn if no cached client exists. createFn may return
+// nil (e.g. if the transport could not be built); nil results are not cached, so
+// the next call retries. The createFn is called outside the cache lock via
+// singleflight to avoid blocking concurrent cache reads during slow creation.
+func (c *ClientCache) GetOrCreateK8sClient(key clientCacheKey, createFn func() *KubernetesClient) *KubernetesClient {
+	ctx := context.Background()
+	typeAttr := metric.WithAttributes(attrClientTypeK8s)
+	c.metrics.lookups.Add(ctx, 1, typeAttr)
+
+	// Fast path: check the cache
+	if client, ok := c.k8sClients.Get(key); ok {
+		c.metrics.hits.Add(ctx, 1, typeAttr)
+		return client
+	}
+
+	// Slow path: use singleflight to create outside the lock
+	sfKey := key.singleflightKey()
+	val, _, _ := c.sfK8s.Do(sfKey, func() (any, error) {
+		if client, ok := c.k8sClients.Get(key); ok {
+			return client, nil
+		}
+
+		client := createFn()
+		// Don't cache nil clients, so a transient creation failure is retried.
+		if client == nil {
+			return (*KubernetesClient)(nil), nil
+		}
+
+		c.k8sClients.Add(key, client)
+		c.metrics.misses.Add(ctx, 1, typeAttr)
+		c.metrics.size.Record(ctx, int64(c.k8sClients.Len()), typeAttr)
+		c.logger.Debug("Cached new Kubernetes client", "key", key, "cache_size", c.k8sClients.Len())
+
+		return client, nil
+	})
+
+	return val.(*KubernetesClient)
+}
+
 // Close cleans up cached clients. For incident clients, idle connections
 // are closed via the underlying HTTP transport. Grafana clients use a
 // go-openapi runtime whose transport is set via reflection, so we clear
-// the map and let the GC reclaim resources.
+// the cache and let the GC reclaim resources.
 func (c *ClientCache) Close() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for key, client := range c.incidentClients {
-		if client.HTTPClient != nil {
-			client.HTTPClient.CloseIdleConnections()
-		}
-		delete(c.incidentClients, key)
-	}
-	for key := range c.grafanaClients {
-		delete(c.grafanaClients, key)
-	}
+	c.incidentClients.Purge()
+	c.grafanaClients.Purge()
+	c.k8sClients.Purge()
 
 	ctx := context.Background()
 	c.metrics.size.Record(ctx, 0, metric.WithAttributes(attrClientTypeGrafana))
 	c.metrics.size.Record(ctx, 0, metric.WithAttributes(attrClientTypeIncident))
+	c.metrics.size.Record(ctx, 0, metric.WithAttributes(attrClientTypeK8s))
 	c.logger.Debug("Client cache closed")
 }
 
 // Size returns the number of cached clients (for testing/metrics).
-func (c *ClientCache) Size() (grafana, incident int) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.grafanaClients), len(c.incidentClients)
+func (c *ClientCache) Size() (grafana, incident, k8s int) {
+	return c.grafanaClients.Len(), c.incidentClients.Len(), c.k8sClients.Len()
 }
 
 // hashAPIKey returns a short hash of the API key for use in logging.
@@ -307,9 +347,7 @@ func extractGrafanaClientCached(cache *ClientCache) httpContextFunc {
 	return func(ctx context.Context, req *http.Request) context.Context {
 		config := GrafanaConfigFromContext(ctx)
 		logger := config.LoggerOrDefault()
-		if config.OrgID == 0 {
-			logger.Warn("No org ID found in request headers or environment variables, using default org. Set GRAFANA_ORG_ID or pass X-Grafana-Org-Id header to target a specific org.")
-		}
+		logDefaultOrg(logger, config)
 
 		u, apiKey, basicAuth, _ := extractKeyGrafanaInfoFromReq(req, logger)
 		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID, req)
@@ -335,23 +373,51 @@ func extractIncidentClientCached(cache *ClientCache) httpContextFunc {
 		incidentClient := cache.GetOrCreateIncidentClient(key, func() *incident.Client {
 			incidentURL := fmt.Sprintf("%s/api/plugins/grafana-irm-app/resources/api/v1/", grafanaURL)
 			logger.Debug("Creating new incident client (cache miss)", "url", incidentURL)
-			client := incident.NewClient(incidentURL, apiKey)
+			client, opts := newIncidentClient(incidentURL, apiKey)
 
 			config.OrgID = orgID
-			config.BasicAuth = basicAuth
-			// Don't disable auth: BuildTransport's auth round-tripper is the
-			// only path that injects basicAuth, and api-key callers also need
-			// the org-id / extra-headers / forwarded-headers layers.
-			transport, err := BuildTransport(&config, nil)
-			if err != nil {
-				logger.Error("Failed to create custom transport for incident client, using default", "error", err)
-			} else {
+			transport, err := BuildTransport(&config, nil, opts...)
+			switch {
+			case err == nil:
 				client.HTTPClient.Transport = transport
+			case config.SOCKS5ProxyURL != "" || config.OverrideURL != "":
+				// Fail closed: a default transport would bypass the proxy or URL guard.
+				logger.Error("Failed to create guarded transport for incident client", "error", err)
+				client.HTTPClient.Transport = failClosedTransport(err)
+			default:
+				logger.Error("Failed to create custom transport for incident client, using default", "error", err)
 			}
+			rejectIncidentErrorStatuses(client)
 
 			return client
 		})
 
 		return WithIncidentClient(ctx, incidentClient)
+	}
+}
+
+// extractKubernetesClientCached creates an httpContextFunc that uses the cache.
+func extractKubernetesClientCached(cache *ClientCache) httpContextFunc {
+	return func(ctx context.Context, req *http.Request) context.Context {
+		config := GrafanaConfigFromContext(ctx)
+		logger := config.LoggerOrDefault()
+
+		u, apiKey, basicAuth, _ := extractKeyGrafanaInfoFromReq(req, logger)
+		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID, req)
+
+		k8sClient := cache.GetOrCreateK8sClient(key, func() *KubernetesClient {
+			logger.Debug("Creating new Kubernetes client (cache miss)", "url", u, "api_key_hash", hashAPIKey(apiKey))
+			client, err := NewKubernetesClient(ctx)
+			if err != nil {
+				logger.Warn("Failed to create Kubernetes client; k8s APIs will be unavailable for this request", "error", err)
+				return nil
+			}
+			return client
+		})
+
+		// k8sClient may be nil if creation failed; WithKubernetesClient stores it
+		// and KubernetesClientFromContext returns nil, which callers handle by
+		// falling back to the legacy API.
+		return WithKubernetesClient(ctx, k8sClient)
 	}
 }

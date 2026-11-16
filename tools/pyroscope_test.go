@@ -100,6 +100,30 @@ func TestPyroscopeTools(t *testing.T) {
 		assert.Equal(t, "profile", parsed["query_type"])
 		assert.NotNil(t, parsed["profile"])
 		assert.Nil(t, parsed["metrics"], "metrics should not be present for profile-only")
+
+		table, ok := parsed["profile"].(string)
+		require.True(t, ok, "profile should be a string")
+		assert.Contains(t, table, "Total:")
+		assert.Contains(t, table, "flat%")
+		assert.Contains(t, table, "functions by flat (self) value")
+	})
+
+	t.Run("query Pyroscope profile DOT format", func(t *testing.T) {
+		ctx := newTestContext()
+		result, err := queryPyroscope(ctx, QueryPyroscopeParams{
+			DataSourceUID: "pyroscope",
+			ProfileType:   "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+			Matchers:      `{service_name="pyroscope"}`,
+			QueryType:     "profile",
+			Format:        "dot",
+		})
+		require.NoError(t, err)
+
+		var parsed map[string]any
+		require.NoError(t, json.Unmarshal([]byte(result), &parsed))
+		dot, ok := parsed["profile"].(string)
+		require.True(t, ok, "profile should be a string")
+		assert.Contains(t, dot, "digraph")
 	})
 
 	t.Run("query Pyroscope metrics only", func(t *testing.T) {
@@ -116,6 +140,10 @@ func TestPyroscopeTools(t *testing.T) {
 		require.NoError(t, json.Unmarshal([]byte(result), &parsed))
 		assert.Equal(t, "metrics", parsed["query_type"])
 		assert.Nil(t, parsed["profile"], "profile should not be present for metrics-only")
-		assert.NotNil(t, parsed["metrics"])
+		metrics, ok := parsed["metrics"].(map[string]any)
+		require.True(t, ok, "metrics should be an object")
+		assert.NotEmpty(t, metrics["series"])
+		// CPU time is cumulative, so Grafana reports it as a rate in cores.
+		assert.Equal(t, "cores", metrics["unit"])
 	})
 }

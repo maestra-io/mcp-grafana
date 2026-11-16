@@ -5,215 +5,211 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 
 	aapi "github.com/grafana/amixr-api-go-client"
-	mcpgrafana "github.com/grafana/mcp-grafana"
+	mcpgrafana "github.com/grafana/mcp-grafana/v2"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// newTestServers creates a fake OnCall API server and a fake Grafana server.
-// The OnCall server captures the Authorization header from each request.
-// The Grafana server returns the OnCall URL from the IRM plugin settings.
-// Returns the Grafana server URL and a mutex-protected getter for the captured auth header.
-func newTestServers(t *testing.T) (grafanaURL string, getAuthHeader func() string) {
+func TestAlertGroupActionForState(t *testing.T) {
+	tests := []struct {
+		name       string
+		state      string
+		wantAction string
+		wantErr    bool
+	}{
+		{name: "acknowledged", state: "acknowledged", wantAction: "acknowledge"},
+		{name: "unacknowledged", state: "unacknowledged", wantAction: "unacknowledge"},
+		{name: "resolved", state: "resolved", wantAction: "resolve"},
+		{name: "unresolved", state: "unresolved", wantAction: "unresolve"},
+		{name: "normalizes case and whitespace", state: " Resolved ", wantAction: "resolve"},
+		{name: "rejects a state with no action endpoint", state: "silenced", wantErr: true},
+		{name: "rejects an unknown state", state: "banana", wantErr: true},
+		{name: "rejects an empty state", state: "", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action, err := alertGroupActionForState(tt.state)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantAction, action)
+		})
+	}
+}
+
+// oncallAPITestServer stands in for a Grafana instance that serves IRM plugin
+// settings pointing at its own OnCall API, so the amixr (non-OBO) code path can
+// be exercised end to end. alertGroup is what the read-back GET returns; a nil
+// alertGroup makes that GET fail with 403, mimicking a write-only caller.
+func oncallAPITestServer(t *testing.T, requests *[]string, alertGroup *aapi.AlertGroup, actionStatus int) *httptest.Server {
 	t.Helper()
 
-	var mu sync.Mutex
-	var capturedAuthHeader string
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*requests = append(*requests, r.Method+" "+r.URL.Path)
 
-	oncallServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		capturedAuthHeader = r.Header.Get("Authorization")
-		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"count":0,"next":null,"previous":null,"results":[]}`))
-	}))
-	t.Cleanup(oncallServer.Close)
-
-	grafanaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		resp := map[string]interface{}{
-			"jsonData": map[string]interface{}{
-				"onCallApiUrl": oncallServer.URL,
-			},
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/plugins/grafana-irm-app/settings":
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"jsonData": map[string]string{"onCallApiUrl": srv.URL},
+			}))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/alert_groups/AG123/":
+			if alertGroup == nil {
+				http.Error(w, `{"detail":"permission denied"}`, http.StatusForbidden)
+				return
+			}
+			require.NoError(t, json.NewEncoder(w).Encode(alertGroup))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/alert_groups/AG123/unresolve":
+			w.WriteHeader(actionStatus)
+		default:
+			http.Error(w, "unexpected request", http.StatusTeapot)
 		}
-		_ = json.NewEncoder(w).Encode(resp)
 	}))
-	t.Cleanup(grafanaServer.Close)
-
-	getAuthHeader = func() string {
-		mu.Lock()
-		defer mu.Unlock()
-		return capturedAuthHeader
-	}
-
-	return grafanaServer.URL, getAuthHeader
+	t.Cleanup(srv.Close)
+	return srv
 }
 
-func TestOncallClientFromContext_UsesOnCallTokenWhenSet(t *testing.T) {
-	grafanaURL, getAuthHeader := newTestServers(t)
-
-	config := mcpgrafana.GrafanaConfig{
-		URL:         grafanaURL,
-		APIKey:      "sa-token",
-		OnCallToken: "personal-oncall-token",
-	}
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), config)
-
-	svc, err := getAlertGroupServiceFromContext(ctx)
-	require.NoError(t, err)
-
-	_, _, err = svc.ListAlertGroups(&aapi.ListAlertGroupOptions{})
-	require.NoError(t, err)
-
-	require.Equal(t, "personal-oncall-token", getAuthHeader())
-}
-
-func TestOncallClientFromContext_FallsBackToAPIKey(t *testing.T) {
-	grafanaURL, getAuthHeader := newTestServers(t)
-
-	config := mcpgrafana.GrafanaConfig{
-		URL:         grafanaURL,
-		APIKey:      "sa-token",
-		OnCallToken: "",
-	}
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), config)
-
-	svc, err := getAlertGroupServiceFromContext(ctx)
-	require.NoError(t, err)
-
-	_, _, err = svc.ListAlertGroups(&aapi.ListAlertGroupOptions{})
-	require.NoError(t, err)
-
-	require.Equal(t, "sa-token", getAuthHeader())
-}
-
-func TestOncallClientFromContext_OnCallTokenSetAPIKeyEmpty(t *testing.T) {
-	grafanaURL, getAuthHeader := newTestServers(t)
-
-	config := mcpgrafana.GrafanaConfig{
-		URL:         grafanaURL,
-		APIKey:      "",
-		OnCallToken: "personal-oncall-token",
-	}
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), config)
-
-	svc, err := getAlertGroupServiceFromContext(ctx)
-	require.NoError(t, err)
-
-	_, _, err = svc.ListAlertGroups(&aapi.ListAlertGroupOptions{})
-	require.NoError(t, err)
-
-	require.Equal(t, "personal-oncall-token", getAuthHeader())
-}
-
-func TestOncallClientFromContext_BothTokensEmpty(t *testing.T) {
-	grafanaURL, _ := newTestServers(t)
-
-	config := mcpgrafana.GrafanaConfig{
-		URL:         grafanaURL,
-		APIKey:      "",
-		OnCallToken: "",
-	}
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), config)
-
-	_, err := oncallClientFromContext(ctx)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "no OnCall authentication token")
-}
-
-func TestOncallClientFromContext_WhitespaceOnCallToken(t *testing.T) {
-	grafanaURL, _ := newTestServers(t)
-
-	// Whitespace-only token is not empty string, so our code treats it as "set"
-	// and does NOT fall back to APIKey. The whitespace token will be sent as-is
-	// in the Authorization header and rejected by the OnCall API at runtime.
-	config := mcpgrafana.GrafanaConfig{
-		URL:         grafanaURL,
-		APIKey:      "sa-token",
-		OnCallToken: "   ",
-	}
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), config)
-
-	// Client creation should succeed (validation happens server-side).
-	_, err := oncallClientFromContext(ctx)
-	require.NoError(t, err)
-}
-
-// TestGetAlertGroup_SurfacesDetailFields proves the wrapper preserves fields
-// that the upstream amixr-api-go-client AlertGroup struct drops:
-// acknowledged_by, resolved_by, silenced_at, last_alert.
-func TestGetAlertGroup_SurfacesDetailFields(t *testing.T) {
-	detailJSON := `{
-		"id": "I12345",
-		"integration_id": "C1",
-		"route_id": "R1",
-		"alerts_count": 3,
-		"state": "firing",
-		"created_at": "2026-05-01T00:00:00Z",
-		"resolved_at": "",
-		"acknowledged_at": "2026-05-01T01:00:00Z",
-		"title": "TestAlert",
-		"permalinks": {"slack": "https://example/slack"},
-		"acknowledged_by": "user-1",
-		"resolved_by": "",
-		"silenced_at": "",
-		"last_alert": {
-			"id": "A1",
-			"created_at": "2026-05-01T02:00:00Z",
-			"payload": {"ruleName": "TestRule", "message": "hello", "labels": {"severity": "high"}}
-		}
-	}`
-
-	oncallServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == "/api/v1/alert_groups/I12345/" {
-			_, _ = w.Write([]byte(detailJSON))
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	t.Cleanup(oncallServer.Close)
-
-	grafanaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"jsonData": map[string]interface{}{"onCallApiUrl": oncallServer.URL},
-		})
-	}))
-	t.Cleanup(grafanaServer.Close)
+func TestUpdateAlertGroupReadsBackRealState(t *testing.T) {
+	var requests []string
+	// OnCall reports "new" after an unresolve; "unresolved" is a transition,
+	// not a state, so the result must not echo the requested value back.
+	srv := oncallAPITestServer(t, &requests, &aapi.AlertGroup{
+		ID:          "AG123",
+		State:       "new",
+		Title:       "Disk full",
+		AlertsCount: 2,
+	}, http.StatusOK)
 
 	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
-		URL:    grafanaServer.URL,
-		APIKey: "sa-token",
+		URL:    srv.URL,
+		APIKey: "oncall-token",
 	})
 
-	result, err := getAlertGroup(ctx, GetAlertGroupParams{AlertGroupID: "I12345"})
+	result, err := updateAlertGroup(ctx, UpdateAlertGroupParams{
+		AlertGroupID: "AG123",
+		State:        "unresolved",
+	})
 	require.NoError(t, err)
-	require.NotNil(t, result)
-
-	require.Equal(t, "I12345", result.ID)
-	require.Equal(t, "user-1", result.AcknowledgedBy)
-	require.Equal(t, "", result.ResolvedBy)
-	require.Equal(t, "", result.SilencedAt)
-	require.NotNil(t, result.LastAlert)
-	require.Equal(t, "A1", result.LastAlert.ID)
-	require.Equal(t, "2026-05-01T02:00:00Z", result.LastAlert.CreatedAt)
-
-	var payload map[string]interface{}
-	require.NoError(t, json.Unmarshal(result.LastAlert.Payload, &payload))
-	require.Equal(t, "TestRule", payload["ruleName"])
-	require.Equal(t, "hello", payload["message"])
+	assert.Equal(t, &UpdateAlertGroupResult{
+		AlertGroupID: "AG123",
+		Action:       "unresolve",
+		Updated:      true,
+		State:        "new",
+	}, result)
+	assert.Equal(t, []string{
+		"GET /api/plugins/grafana-irm-app/settings",
+		"POST /api/v1/alert_groups/AG123/unresolve",
+		"GET /api/plugins/grafana-irm-app/settings",
+		"GET /api/v1/alert_groups/AG123/",
+	}, requests, "the action must be posted before the state is read back")
 }
 
-func TestGetAlertGroup_EmptyID(t *testing.T) {
+func TestUpdateAlertGroupStillSucceedsWhenReadBackIsForbidden(t *testing.T) {
+	var requests []string
+	srv := oncallAPITestServer(t, &requests, nil, http.StatusOK)
+
 	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
-		URL:    "http://unused",
-		APIKey: "sa-token",
+		URL:    srv.URL,
+		APIKey: "oncall-token",
 	})
-	_, err := getAlertGroup(ctx, GetAlertGroupParams{AlertGroupID: "   "})
+
+	result, err := updateAlertGroup(ctx, UpdateAlertGroupParams{
+		AlertGroupID: "AG123",
+		State:        "unresolved",
+	})
+	// The write already landed, so a failed read-back must not be reported as a
+	// failed tool call: that would invite a retry of a completed mutation.
+	require.NoError(t, err)
+	assert.True(t, result.Updated)
+	assert.Equal(t, "unresolve", result.Action)
+	assert.Empty(t, result.State)
+	assert.Contains(t, result.StateWarning, "the unresolve succeeded")
+	assert.Contains(t, requests, "POST /api/v1/alert_groups/AG123/unresolve")
+}
+
+func TestUpdateAlertGroupFailsWhenActionFails(t *testing.T) {
+	var requests []string
+	srv := oncallAPITestServer(t, &requests, nil, http.StatusForbidden)
+
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL:    srv.URL,
+		APIKey: "oncall-token",
+	})
+
+	_, err := updateAlertGroup(ctx, UpdateAlertGroupParams{
+		AlertGroupID: "AG123",
+		State:        "unresolved",
+	})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "alertGroupId is required")
+	assert.Contains(t, err.Error(), "unresolve OnCall alert group AG123")
+	assert.NotContains(t, requests, "GET /api/v1/alert_groups/AG123/",
+		"no state should be read back when the action itself failed")
+}
+
+func TestUpdateAlertGroupUsesProxyWhenOboTokensAvailable(t *testing.T) {
+	var requests []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+
+		switch {
+		case r.Method == http.MethodPost &&
+			r.URL.Path == "/api/plugins/grafana-irm-app/resources/alertgroups/AG123/resolve/":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet &&
+			r.URL.Path == "/api/plugins/grafana-irm-app/resources/alertgroups/AG123/":
+			w.Header().Set("Content-Type", "application/json")
+			// Status 2 is "resolved" in the internal API's numeric encoding.
+			require.NoError(t, json.NewEncoder(w).Encode(onCallAlertGroupInternal{
+				PK:          "AG123",
+				AlertsCount: 1,
+				Status:      float64(2),
+			}))
+		default:
+			http.Error(w, "unexpected request", http.StatusTeapot)
+		}
+	}))
+	defer srv.Close()
+
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL:         srv.URL,
+		AccessToken: "test-access",
+		IDToken:     "test-id",
+	})
+
+	result, err := updateAlertGroup(ctx, UpdateAlertGroupParams{
+		AlertGroupID: "AG123",
+		State:        "resolved",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, &UpdateAlertGroupResult{
+		AlertGroupID: "AG123",
+		Action:       "resolve",
+		Updated:      true,
+		State:        "resolved",
+	}, result)
+	assert.Equal(t, []string{
+		"POST /api/plugins/grafana-irm-app/resources/alertgroups/AG123/resolve/",
+		"GET /api/plugins/grafana-irm-app/resources/alertgroups/AG123/",
+	}, requests)
+}
+
+func TestUpdateAlertGroupRejectsBadInputWithoutCallingOnCall(t *testing.T) {
+	// No Grafana config in the context, so any HTTP attempt would error with a
+	// connection or settings failure rather than the validation message.
+	ctx := context.Background()
+
+	_, err := updateAlertGroup(ctx, UpdateAlertGroupParams{AlertGroupID: "AG123", State: "silenced"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `unsupported alert group state "silenced"`)
+
+	_, err = updateAlertGroup(ctx, UpdateAlertGroupParams{AlertGroupID: "  ", State: "resolved"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "alertGroupId is required")
 }

@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 )
 
 // KubernetesClient is a lightweight, generic HTTP client for Grafana's
@@ -29,6 +32,15 @@ type KubernetesClient struct {
 	// HTTPClient is the underlying HTTP client used for requests.
 	// If nil, http.DefaultClient is used.
 	HTTPClient *http.Client
+
+	// capMu guards groupVersionsCache.
+	capMu sync.Mutex
+	// groupVersionsCache caches the served versions per API group, discovered
+	// once via GET /apis/<group>. A cached empty slice means the group is not
+	// served (404). Capabilities are a property of the target Grafana instance,
+	// so this is resolved once per client (i.e. once per connection) and reused;
+	// transient discovery errors are not cached, so they are retried.
+	groupVersionsCache map[string][]string
 }
 
 // NewKubernetesClient creates a KubernetesClient from the GrafanaConfig in ctx.
@@ -59,6 +71,7 @@ func NewKubernetesClient(ctx context.Context) (*KubernetesClient, error) {
 			Transport: transport,
 			Timeout:   timeout,
 		},
+		groupVersionsCache: make(map[string][]string),
 	}, nil
 }
 
@@ -233,6 +246,68 @@ func (c *KubernetesClient) Create(ctx context.Context, desc ResourceDescriptor, 
 		return nil, err
 	}
 	return c.mutate(ctx, http.MethodPost, desc.BasePath(namespace), obj)
+}
+
+// GroupVersions returns the API versions served for the given group, fetched
+// from GET /apis/<group> and cached once per client. A non-nil empty slice
+// means the group is not served (the discovery endpoint returned 404). Only
+// definitive results (200 or 404) are cached; transient errors are returned
+// without caching so the next call retries.
+func (c *KubernetesClient) GroupVersions(ctx context.Context, group string) ([]string, error) {
+	c.capMu.Lock()
+	if versions, ok := c.groupVersionsCache[group]; ok {
+		c.capMu.Unlock()
+		return versions, nil
+	}
+	c.capMu.Unlock()
+
+	body, err := c.doRequest(ctx, http.MethodGet, "/apis/"+group, nil)
+	if err != nil {
+		var apiErr *KubernetesAPIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			// Group not served — cache the (empty) result.
+			c.storeGroupVersions(group, []string{})
+			return []string{}, nil
+		}
+		// Transient/unknown error: don't cache, let the caller retry later.
+		return nil, err
+	}
+
+	var groupList struct {
+		Versions []struct {
+			Version string `json:"version"`
+		} `json:"versions"`
+	}
+	if err := json.Unmarshal(body, &groupList); err != nil {
+		return nil, fmt.Errorf("decode api group %q discovery: %w", group, err)
+	}
+
+	versions := make([]string, 0, len(groupList.Versions))
+	for _, v := range groupList.Versions {
+		versions = append(versions, v.Version)
+	}
+	c.storeGroupVersions(group, versions)
+	return versions, nil
+}
+
+func (c *KubernetesClient) storeGroupVersions(group string, versions []string) {
+	c.capMu.Lock()
+	if c.groupVersionsCache == nil {
+		c.groupVersionsCache = make(map[string][]string)
+	}
+	c.groupVersionsCache[group] = versions
+	c.capMu.Unlock()
+}
+
+// SupportsGroupVersion reports whether the given group serves the given version
+// (using the cached discovery from GroupVersions). On a transient discovery
+// error it returns false, so callers conservatively fall back to the legacy API.
+func (c *KubernetesClient) SupportsGroupVersion(ctx context.Context, group, version string) bool {
+	versions, err := c.GroupVersions(ctx, group)
+	if err != nil {
+		return false
+	}
+	return slices.Contains(versions, version)
 }
 
 // KubernetesAPIError is returned when the server responds with a non-2xx status.

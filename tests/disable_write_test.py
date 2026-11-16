@@ -8,7 +8,10 @@ pytestmark = pytest.mark.anyio
 
 @pytest.fixture
 def grafana_env():
-    env = {"GRAFANA_URL": os.environ.get("GRAFANA_URL", "http://localhost:3000")}
+    env = {
+        "GRAFANA_URL": os.environ.get("GRAFANA_URL", "http://localhost:3000"),
+        "GRAFANA_USAGE_STATS": "disabled",
+    }
     # Check for the new service account token environment variable first
     if key := os.environ.get("GRAFANA_SERVICE_ACCOUNT_TOKEN"):
         env["GRAFANA_SERVICE_ACCOUNT_TOKEN"] = key
@@ -38,30 +41,42 @@ async def test_disable_write_flag_disables_write_tools(grafana_env):
                 "create_folder",
                 "create_incident",
                 "add_activity_to_incident",
+                "update_incident",
                 "create_annotation",
                 "update_annotation",
-                "find_error_pattern_logs",
-                "find_slow_requests",
+                "delete_annotation",
+                "update_alert_group",
+                "alerting_rules_write",
+                "alerting_silences_write",
+                "alerting_routing_write",
             ]
 
             for tool in write_tools:
                 assert tool not in tool_names, f"Write tool '{tool}' should not be available with --disable-write flag"
 
-            # Verify the read-only alerting_manage_rules is present (not the write variant)
-            assert "alerting_manage_rules" in tool_names, "alerting_manage_rules should be available with --disable-write flag"
-            alerting_tool = next(t for t in tools_result.tools if t.name == "alerting_manage_rules")
-            assert alerting_tool.annotations.readOnlyHint is True, "alerting_manage_rules should be read-only with --disable-write flag"
+            # Verify the read-only alerting_rules_read is present
+            assert "alerting_rules_read" in tool_names, "alerting_rules_read should be available with --disable-write flag"
+            alerting_tool = next(t for t in tools_result.tools if t.name == "alerting_rules_read")
+            assert alerting_tool.annotations.read_only_hint is True, "alerting_rules_read should be read-only with --disable-write flag"
+
+            # Verify the read-only alerting_silences_read is present
+            assert "alerting_silences_read" in tool_names, "alerting_silences_read should be available with --disable-write flag"
+            silences_tool = next(t for t in tools_result.tools if t.name == "alerting_silences_read")
+            assert silences_tool.annotations.read_only_hint is True, "alerting_silences_read should be read-only with --disable-write flag"
 
             # Verify read tools ARE still present
             read_tools = [
                 "get_dashboard_by_uid",
-                "alerting_manage_rules",
+                "alerting_rules_read",
+                "alerting_silences_read",
                 "alerting_manage_routing",
                 "list_incidents",
                 "get_incident",
-                "get_sift_investigation",
+                "list_incident_custom_fields",
                 "get_annotations",
                 "get_annotation_tags",
+                "list_alert_groups",
+                "get_alert_group",
             ]
 
             for tool in read_tools:
@@ -89,30 +104,38 @@ async def test_without_disable_write_flag_enables_write_tools(grafana_env):
                 "create_folder",
                 "create_incident",
                 "add_activity_to_incident",
+                "update_incident",
                 "create_annotation",
                 "update_annotation",
-                "find_error_pattern_logs",
-                "find_slow_requests",
+                "delete_annotation",
+                "update_alert_group",
+                "alerting_rules_write",
+                "alerting_silences_write",
+                "alerting_routing_write",
             ]
 
             for tool in write_tools:
                 assert tool in tool_names, f"Write tool '{tool}' should be available without --disable-write flag"
 
-            # Verify the read-write alerting_manage_rules is present (with destructive hint)
-            assert "alerting_manage_rules" in tool_names, "alerting_manage_rules should be available without --disable-write flag"
-            alerting_tool = next(t for t in tools_result.tools if t.name == "alerting_manage_rules")
-            assert alerting_tool.annotations.destructiveHint is True, "alerting_manage_rules should be marked destructive without --disable-write flag"
+            # Verify the read-write alerting_rules_write is present (with destructive hint)
+            alerting_tool = next(t for t in tools_result.tools if t.name == "alerting_rules_write")
+            assert alerting_tool.annotations.destructive_hint is True, "alerting_rules_write should be marked destructive without --disable-write flag"
 
             # Verify read tools are also present
             read_tools = [
                 "get_dashboard_by_uid",
-                "alerting_manage_rules",
+                "alerting_rules_read",
+                "alerting_silences_read",
+                "alerting_rules_write",
+                "alerting_silences_write",
                 "alerting_manage_routing",
                 "list_incidents",
                 "get_incident",
-                "get_sift_investigation",
+                "list_incident_custom_fields",
                 "get_annotations",
                 "get_annotation_tags",
+                "list_alert_groups",
+                "get_alert_group",
             ]
 
             for tool in read_tools:

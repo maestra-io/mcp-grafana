@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -17,57 +18,10 @@ import (
 	"time"
 
 	"github.com/invopop/jsonschema"
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	mcpgrafana "github.com/grafana/mcp-grafana"
+	mcpgrafana "github.com/grafana/mcp-grafana/v2"
 )
-
-// outputFormat* are the wire values accepted on GetPanelImageParams.OutputFormat.
-// Kept unexported because they are a JSON wire contract, not a Go API —
-// callers pass strings over MCP, not the Go constants.
-const (
-	outputFormatImage    = "image"    // single ImageContent; legacy/default shape
-	outputFormatResource = "resource" // single EmbeddedResource with a BlobResourceContents
-	outputFormatBoth     = "both"     // both blocks (image for inline display, resource for out-of-band bytes)
-	// outputFormatTextBase64 returns a single TextContent block with just
-	// the base64-encoded PNG bytes and nothing else. Motivation: Claude
-	// Code surfaces ImageContent (and image/* EmbeddedResource blobs) as
-	// images to the user and as vision input to the model, but hides the
-	// base64 string from the model's text context — so a skill that
-	// wants the model to decode the bytes to disk via Bash/Write has no
-	// way to see them. TextContent is passed through as text, which
-	// closes that gap. Behavior on non-Claude-Code clients is
-	// client-specific: some (Cursor, Zed, Claude Desktop) will render the
-	// raw base64 verbatim in the transcript, which is hostile to humans —
-	// callers on those clients should stick to 'image'/'resource'/'both'.
-	//
-	// Cost: the base64 rides back through the model's output window,
-	// which means the model must re-emit it (Write tool content or Bash
-	// heredoc) to land bytes on disk. Enforced upper bound is
-	// textBase64MaxImageBytes; practical limit is lower on models with
-	// smaller max_output_tokens. Use only for single-panel screenshots,
-	// not full-dashboard captures.
-	outputFormatTextBase64 = "text_base64"
-	outputFormatDefault    = outputFormatImage
-)
-
-// renderResponseLimitBytes caps how much we'll read from the Grafana
-// /render endpoint before giving up. Follows the same bounded-read
-// pattern as the other HTTP tools in this package (sift, elasticsearch,
-// loki, clickhouse — all in the ~10MiB range) but with a higher cap to
-// accommodate PNG renders: single panels average ~100KiB and full
-// dashboards rarely exceed ~2MiB even at scale=3, so 25MiB leaves
-// plenty of headroom while still bounding blast radius.
-const renderResponseLimitBytes = 25 * 1024 * 1024 // 25 MiB
-
-// textBase64MaxImageBytes caps the raw-image size accepted by the
-// text_base64 output path. The mode requires the model to emit the full
-// base64 string in a single output turn (→ Write/Bash), so a too-large
-// payload gets silently truncated by the model's output cap and a
-// corrupted file lands on disk. Prefer a hard server-side error with a
-// clear remediation hint over that silent failure mode.
-const textBase64MaxImageBytes = 512 * 1024 // 512 KiB (~683 KiB base64)
 
 // StringOrSlice is a type that can be unmarshaled from either a JSON string
 // or an array of strings. This allows dashboard variables to support both
@@ -114,21 +68,56 @@ func (StringOrSlice) JSONSchema() *jsonschema.Schema {
 	}
 }
 
+// outputFormat* are the wire values accepted on GetPanelImageParams.OutputFormat
+// (maestra-io fork). They are a JSON wire contract, not a Go API.
+const (
+	outputFormatImage    = "image"    // single ImageContent; upstream/default shape
+	outputFormatResource = "resource" // single EmbeddedResource with a blob
+	outputFormatBoth     = "both"     // image for inline display + resource for out-of-band bytes
+	// outputFormatTextBase64 returns a single TextContent block with only the
+	// base64-encoded PNG. Claude Code shows ImageContent to the model as vision
+	// input but hides the base64, so a skill that must write the PNG to disk
+	// (Bash/Write) cannot see the bytes; TextContent closes that gap. The bytes
+	// ride through the model's output window, hence textBase64MaxImageBytes.
+	outputFormatTextBase64 = "text_base64"
+	outputFormatDefault    = outputFormatImage
+)
+
+// renderResponseLimitBytes caps how much is read from /render. PNG renders are
+// ~100KiB per panel and rarely above ~2MiB for a full dashboard at scale=3.
+const renderResponseLimitBytes = 25 * 1024 * 1024 // 25 MiB
+
+// textBase64MaxImageBytes caps the raw image accepted by text_base64: the model
+// must re-emit the whole base64 string in one output turn, and a payload cut by
+// its output cap would land a corrupt file on disk. Fail loudly instead.
+const textBase64MaxImageBytes = 512 * 1024 // 512 KiB (~683 KiB base64)
+
 type GetPanelImageParams struct {
 	DashboardUID string                   `json:"dashboardUid,omitempty" jsonschema:"description=The UID of a stored dashboard containing the panel. Required unless provisioningPreview is provided."`
 	PanelID      *int                     `json:"panelId,omitempty" jsonschema:"description=The ID of the panel to render. If omitted\\, the entire dashboard is rendered"`
-	Width        *int                     `json:"width,omitempty" jsonschema:"description=Width of the rendered image in pixels. Defaults to 1000"`
-	Height       *int                     `json:"height,omitempty" jsonschema:"description=Height of the rendered image in pixels. Defaults to 500"`
+	Width        *int                     `json:"width,omitempty" jsonschema:"description=Positive viewport width in CSS pixels. See tool description for per-view defaults. Capped so width times scale is at most 3000. The renderer may raise values below its configured minimum (1000 by default)."`
+	Height       *int                     `json:"height,omitempty" jsonschema:"description=Positive viewport height in CSS pixels\\, or -1 for full-page rendering. See tool description for per-view defaults. Positive heights are capped so height times scale is at most 3000. The renderer may raise values below its configured minimum (500 by default)."`
 	TimeRange    *RenderTimeRange         `json:"timeRange,omitempty" jsonschema:"description=Time range for the rendered image"`
 	Variables    map[string]StringOrSlice `json:"variables,omitempty" jsonschema:"description=Dashboard variables to apply. Values can be a single string or an array of strings for multi-value variables (e.g.\\, {\"var-datasource\": \"prometheus\"\\, \"var-instance\": [\"server1\"\\, \"server2\"]})"`
 	Theme        *string                  `json:"theme,omitempty" jsonschema:"description=Theme for the rendered image: light or dark. Defaults to dark"`
-	Scale        *int                     `json:"scale,omitempty" jsonschema:"description=Scale factor for the image (1-3). Defaults to 1"`
-	Timeout      *int                     `json:"timeout,omitempty" jsonschema:"description=Rendering timeout in seconds. Defaults to 60"`
-	OutputFormat *string                  `json:"outputFormat,omitempty" jsonschema:"enum=image,enum=resource,enum=both,enum=text_base64,default=image,description=How to package the rendered bytes. 'image' (default) returns a single MCP ImageContent block for backward compatibility. 'resource' returns an EmbeddedResource with a BlobResourceContents blob - useful for clients or tooling that cannot decode inline ImageContent payloads. 'both' returns both content blocks so the model can display the image inline while out-of-band scripts recover the raw bytes from the resource. 'text_base64' returns a single TextContent block with only the base64 bytes as plain text - use this when the caller needs to pipe the image through a Bash/Write step to land on disk (ImageContent/EmbeddedResource blobs are rendered as images by most MCP clients and are not accessible to the model as text). Note that 'both' roughly doubles response size and 'text_base64' consumes real output tokens."`
+	Scale        *int                     `json:"scale,omitempty" jsonschema:"description=Image scale factor. See tool description for default and limits. Higher scales reduce the maximum allowed viewport dimensions."`
+	Timeout      *int                     `json:"timeout,omitempty" jsonschema:"description=Rendering timeout in seconds. Defaults to 60\\, capped at 120"`
+	OutputFormat *string                  `json:"outputFormat,omitempty" jsonschema:"enum=image,enum=resource,enum=both,enum=text_base64,default=image,description=How to package the rendered bytes. 'image' (default) returns a single MCP ImageContent block. 'resource' returns an EmbeddedResource with a blob - useful for clients or tooling that cannot decode inline ImageContent payloads. 'both' returns both blocks so the model can display the image inline while out-of-band scripts recover the raw bytes from the resource. 'text_base64' returns a single TextContent block with only the base64 PNG bytes as plain text - use this when the caller needs to pipe the image through a Bash/Write step to land on disk (limit 512 KiB of PNG). Note that 'both' roughly doubles response size and 'text_base64' consumes real output tokens."`
 	// ProvisioningPreview renders a dashboard from a provisioning repository
 	// branch that has not yet been merged or applied. Mutually exclusive with
 	// dashboardUid.
 	ProvisioningPreview *ProvisioningPreview `json:"provisioningPreview,omitempty" jsonschema:"description=Render a dashboard from a provisioning repository branch (e.g. a git-sync PR preview). Mutually exclusive with dashboardUid."`
+	// Explore renders an ad-hoc Explore view instead of a stored dashboard.
+	// Mutually exclusive with dashboardUid and provisioningPreview.
+	Explore *RenderExplore `json:"explore,omitempty" jsonschema:"description=Render an ad-hoc Explore view for a datasource and queries instead of a stored dashboard. Mutually exclusive with dashboardUid and provisioningPreview. Requires Grafana 10.2 or later."`
+}
+
+// RenderExplore describes an Explore view to render. The state is encoded the
+// same way as the explore links produced by generate_deeplink; the time range
+// comes from GetPanelImageParams.TimeRange.
+type RenderExplore struct {
+	DatasourceUID string                   `json:"datasourceUid" jsonschema:"required,description=Datasource UID to query"`
+	Queries       []map[string]interface{} `json:"queries,omitempty" jsonschema:"description=List of query objects (e.g. [{\"refId\":\"A\"\\, \"expr\":\"up\"}])"`
 }
 
 type RenderTimeRange struct {
@@ -151,18 +140,26 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 	baseURL := config.URL
 
 	if baseURL == "" {
-		return nil, fmt.Errorf("grafana URL not configured. Please set GRAFANA_URL environment variable or X-Grafana-URL header")
+		return nil, fmt.Errorf("grafana URL not configured. Please set GRAFANA_URL environment variable")
 	}
 
-	// Validate outputFormat up front so we fail fast on typos rather than
-	// silently returning the wrong content shape.
+	// Validate outputFormat up front so a typo fails fast instead of
+	// returning the wrong content shape.
 	outputFormat, err := resolveOutputFormat(args.OutputFormat)
 	if err != nil {
 		return nil, err
 	}
 
-	// Build the render URL
-	renderURL, err := buildRenderURL(baseURL, args)
+	// The org to render from comes from config.OrgID, which
+	// OrgIDOverrideMiddleware sets from the per-call orgId argument when dynamic
+	// multi-org is enabled and which otherwise carries the connection's org. This
+	// tool declares no orgId of its own, so it behaves like every other tool: the
+	// argument exists only when --dynamic-multi-org is set. Reading the org from
+	// the context also keeps the X-Grafana-Org-Id header the transport adds in
+	// step with the render URL's targetOrgId.
+	renderOrg := config.OrgID
+
+	renderURL, err := buildRenderURL(baseURL, renderOrg, args)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build render URL: %w", err)
 	}
@@ -177,13 +174,9 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 		return nil, fmt.Errorf("failed to build HTTP transport: %w", err)
 	}
 
-	timeout := 60 * time.Second
-	if args.Timeout != nil && *args.Timeout > 0 {
-		timeout = time.Duration(*args.Timeout) * time.Second
-	}
 	httpClient := &http.Client{
 		Transport: transport,
-		Timeout:   timeout,
+		Timeout:   renderTimeout(args),
 	}
 
 	// Create request
@@ -203,104 +196,86 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Check response status. The error body is bounded by the same limit
-	// as the success path so a hostile upstream can't OOM us by streaming
-	// a huge 5xx response. If the body overflowed even that cap we skip
-	// embedding it in the error message (it would just balloon logs/tool
-	// response without adding any useful diagnostic).
+	// Check response status
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, renderResponseLimitBytes+1))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		if resp.StatusCode == http.StatusNotFound {
 			return nil, fmt.Errorf("image renderer not available. Ensure the Grafana Image Renderer service is installed and configured. See https://grafana.com/docs/grafana/latest/setup-grafana/image-rendering/")
-		}
-		if int64(len(body)) > renderResponseLimitBytes {
-			return nil, fmt.Errorf(
-				"failed to render image: HTTP %d - response body exceeded %d-byte limit",
-				resp.StatusCode, renderResponseLimitBytes,
-			)
 		}
 		return nil, fmt.Errorf("failed to render image: HTTP %d - %s", resp.StatusCode, string(body))
 	}
 
-	// Read the image data. Bounded by renderResponseLimitBytes so a
-	// misbehaving upstream can't OOM the server.
-	imageData, err := io.ReadAll(io.LimitReader(resp.Body, renderResponseLimitBytes+1))
+	// Read the image data
+	imageData, err := readResponseBody(resp.Body, renderResponseLimitBytes)
 	if err != nil {
+		if errors.Is(err, errResponseBodyTooLarge) {
+			err = fmt.Errorf("%w of %d bytes; try a smaller width, height or scale", errResponseBodyTooLarge, renderResponseLimitBytes)
+		}
 		return nil, fmt.Errorf("failed to read image data: %w", err)
 	}
-	if int64(len(imageData)) > renderResponseLimitBytes {
-		return nil, fmt.Errorf("render response exceeded %d-byte limit", renderResponseLimitBytes)
-	}
 	if len(imageData) == 0 {
-		// A 200 OK with an empty body would otherwise produce an
-		// ImageContent whose Data is "" — downstream hooks then write a
-		// zero-byte file and it looks like a successful render. Fail
-		// loudly so the caller knows the render actually failed.
+		// A 200 with an empty body would otherwise look like a successful
+		// render and land a zero-byte file downstream.
 		return nil, fmt.Errorf("grafana returned an empty image body (HTTP 200)")
 	}
 
 	mimeType := parseImageMIME(resp.Header.Get("Content-Type"))
-
-	// text_base64 is explicitly advertised as "base64 PNG bytes" in the
-	// tool description; the model will name the output file .png. Reject
-	// non-PNG upstream responses rather than silently emitting bytes a
-	// caller will misidentify. We enforce this with two independent
-	// checks because neither alone is enough:
-	//
-	//   1. Content-Type header must be image/png. Catches proxies that
-	//      serve a different image format (image/jpeg, image/webp).
-	//   2. Magic-byte check on the body itself. Catches upstreams that
-	//      serve HTML/error pages with a missing or wrong Content-Type
-	//      (parseImageMIME falls back to "image/png" when the header is
-	//      absent or malformed, so the first check alone would pass).
 	if outputFormat == outputFormatTextBase64 {
+		// text_base64 promises PNG bytes. Check both the header (a proxy
+		// serving another image type) and the magic bytes (an HTML error
+		// page with a missing or wrong Content-Type).
 		if resp.Header.Get("Content-Type") != "" && mimeType != "image/png" {
-			return nil, fmt.Errorf(
-				"outputFormat=text_base64 requires Grafana to return image/png; got %q", mimeType,
-			)
+			return nil, fmt.Errorf("outputFormat=text_base64 requires Grafana to return image/png; got %q", mimeType)
 		}
 		if !hasPNGSignature(imageData) {
-			return nil, fmt.Errorf(
-				"outputFormat=text_base64 requires PNG bytes; response body is not a PNG (got Content-Type %q)",
-				resp.Header.Get("Content-Type"),
-			)
+			return nil, fmt.Errorf("outputFormat=text_base64 requires PNG bytes; response body is not a PNG (got Content-Type %q)", resp.Header.Get("Content-Type"))
+		}
+		if len(imageData) > textBase64MaxImageBytes {
+			return nil, fmt.Errorf("outputFormat=text_base64 payload exceeds %d-byte limit (got %d); reduce width/height/scale or switch to outputFormat=image/resource", textBase64MaxImageBytes, len(imageData))
+		}
+		// Only the base64 string: the caller decodes it verbatim, so no
+		// deeplink block or structured content is added.
+		return buildPanelImageResult(args, outputFormat, mimeType, imageData), nil
+	}
+
+	// Rendering succeeded, so always return the image. The deeplink is
+	// best-effort metadata added only if it builds successfully.
+	result := buildPanelImageResult(args, outputFormat, mimeType, imageData)
+	content := result.Content
+
+	// Use the public base URL, not config.URL, which may be an in-cluster
+	// endpoint the browser can't reach.
+	var structured any
+	if deeplinkBase, err := grafanaBaseURLFromContext(ctx); err == nil && deeplinkResolvesInRenderOrg(ctx, renderOrg) {
+		if deeplink, err := buildDashboardDeeplink(deeplinkBase, args); err == nil {
+			content = append(content, &mcp.TextContent{
+				Meta: mcpgrafana.NewUIContentMeta(mcpgrafana.UIContentKindDeeplink),
+				Text: deeplink,
+			})
+			// Also in structuredContent: some hosts (e.g. Claude) don't forward
+			// content items' _meta to the MCP App, so the viewer can't find the
+			// link in content alone.
+			structured = map[string]any{"deeplink": deeplink}
 		}
 	}
-	// Keep the text_base64 payload small enough that a reasonable Claude
-	// output window can actually emit it back to a Write/Bash step. 512KiB
-	// of raw PNG → ~683KiB of base64 → ~170K tokens at ~4 chars/token on a
-	// base64 alphabet, which is already above a typical 64K output cap
-	// but lets the guard catch obvious misuse (full-dashboard renders)
-	// without false-positive-ing single-panel screenshots.
-	if outputFormat == outputFormatTextBase64 && len(imageData) > textBase64MaxImageBytes {
-		return nil, fmt.Errorf(
-			"outputFormat=text_base64 payload exceeds %d-byte limit (got %d); reduce width/height/scale or switch to outputFormat=image/resource",
-			textBase64MaxImageBytes, len(imageData),
-		)
-	}
 
-	return buildPanelImageResult(args, outputFormat, mimeType, imageData), nil
+	return &mcp.CallToolResult{
+		Content:           content,
+		StructuredContent: structured,
+	}, nil
 }
 
-// pngSignature is the 8-byte ISO/IEC 15948 PNG magic header, as defined
-// in https://www.w3.org/TR/PNG/#5PNG-file-signature.
+// pngSignature is the 8-byte PNG magic header (https://www.w3.org/TR/PNG/#5PNG-file-signature).
 var pngSignature = []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
 
-// hasPNGSignature reports whether data begins with the PNG magic bytes.
-// Used by the text_base64 output path to fail fast on responses that
-// pretend to be PNG (via Content-Type) but aren't.
 func hasPNGSignature(data []byte) bool {
 	return len(data) >= len(pngSignature) && bytes.Equal(data[:len(pngSignature)], pngSignature)
 }
 
-// parseImageMIME extracts the media type (no params) from a Content-Type
-// header, falling back to image/png. It exists because:
-//   - Some gateways (Kong/nginx) append parameters like "; charset=utf-8"
-//     which are nonsensical for images and confuse strict MCP clients that
-//     treat the MIME field as a bare media type.
-//   - Completely missing or non-image types (e.g. text/html from an auth
-//     wall served as 200 OK) should not be labeled as the real content type —
-//     PNG is the only thing the Grafana image renderer actually emits.
+// parseImageMIME extracts the bare media type from a Content-Type header,
+// falling back to image/png: gateways append parameters (strict MCP clients
+// want a bare type) and a non-image type (an auth wall served as 200) must not
+// label the content.
 func parseImageMIME(raw string) string {
 	if raw == "" {
 		return "image/png"
@@ -312,13 +287,8 @@ func parseImageMIME(raw string) string {
 	return mt
 }
 
-// resolveOutputFormat validates the caller-supplied outputFormat. A nil
-// pointer (field omitted) resolves to the default; every other value must
-// match the schema enum exactly. This includes the empty string — an
-// explicit "" is a caller bug, not "I don't care", and silently defaulting
-// it would hide that. The accepted set is exactly what the JSON schema
-// advertises, so a client that validates locally sees the same behavior
-// as the server.
+// resolveOutputFormat validates outputFormat. Omitted means the default; any
+// other value, including "", must match the schema enum exactly.
 func resolveOutputFormat(raw *string) (string, error) {
 	if raw == nil {
 		return outputFormatDefault, nil
@@ -327,92 +297,46 @@ func resolveOutputFormat(raw *string) (string, error) {
 	case outputFormatImage, outputFormatResource, outputFormatBoth, outputFormatTextBase64:
 		return *raw, nil
 	default:
-		return "", fmt.Errorf(
-			"invalid outputFormat %q: expected one of %q, %q, %q, %q",
-			*raw, outputFormatImage, outputFormatResource, outputFormatBoth, outputFormatTextBase64,
-		)
+		return "", fmt.Errorf("invalid outputFormat %q: expected one of %q, %q, %q, %q",
+			*raw, outputFormatImage, outputFormatResource, outputFormatBoth, outputFormatTextBase64)
 	}
 }
 
-// ptr is a tiny helper to produce pointer-typed values for MCP annotations,
-// which require *float64 to distinguish "not set" from zero.
-func ptr[T any](v T) *T { return &v }
-
-// buildPanelImageResult packages raw image bytes into the requested MCP
-// content shape. Split out so the HTTP plumbing above stays readable and so
-// tests can cover the packaging logic without a live Grafana.
-//
-// Annotations follow MCP conventions: the ImageContent is marked for both
-// the user and the model at high priority (it's the display surface). The
-// EmbeddedResource is marked for the user only at low priority so
-// context-pruning clients know they can drop it from the model's context
-// without losing the image — the out-of-band copy is for tooling, not for
-// the LLM.
+// buildPanelImageResult packages the image bytes into the requested content
+// shape. The ImageContent targets user and model at high priority; the
+// EmbeddedResource is for tooling (user only, low priority) so
+// context-pruning clients may drop it from the model's context.
 func buildPanelImageResult(args GetPanelImageParams, outputFormat, mimeType string, imageData []byte) *mcp.CallToolResult {
-	base64Data := base64.StdEncoding.EncodeToString(imageData)
-
 	contents := make([]mcp.Content, 0, 2)
 	if outputFormat == outputFormatImage || outputFormat == outputFormatBoth {
-		contents = append(contents, mcp.ImageContent{
-			Annotated: mcp.Annotated{
-				Annotations: &mcp.Annotations{
-					Audience: []mcp.Role{mcp.RoleUser, mcp.RoleAssistant},
-					Priority: ptr(0.9),
-				},
-			},
-			Type:     "image",
-			Data:     base64Data,
-			MIMEType: mimeType,
+		contents = append(contents, &mcp.ImageContent{
+			Annotations: &mcp.Annotations{Audience: []mcp.Role{"user", "assistant"}, Priority: 0.9},
+			Data:        imageData, // the SDK base64-encodes on the wire
+			MIMEType:    mimeType,
 		})
 	}
 	if outputFormat == outputFormatResource || outputFormat == outputFormatBoth {
-		contents = append(contents, mcp.EmbeddedResource{
-			Annotated: mcp.Annotated{
-				Annotations: &mcp.Annotations{
-					Audience: []mcp.Role{mcp.RoleUser},
-					Priority: ptr(0.1),
-				},
-			},
-			Type: "resource",
-			Resource: mcp.BlobResourceContents{
+		contents = append(contents, &mcp.EmbeddedResource{
+			Annotations: &mcp.Annotations{Audience: []mcp.Role{"user"}, Priority: 0.1},
+			Resource: &mcp.ResourceContents{
 				URI:      buildRenderResourceURI(args, imageData),
 				MIMEType: mimeType,
-				Blob:     base64Data,
+				Blob:     imageData,
 			},
 		})
 	}
 	if outputFormat == outputFormatTextBase64 {
-		// Emit ONLY the base64 string, with no surrounding wrapper or
-		// prose. The caller is expected to read this verbatim into a
-		// Bash/script step (e.g. `base64 -d > file.png`), so any extra
-		// characters would corrupt the decoded output.
-		contents = append(contents, mcp.TextContent{
-			Type: "text",
-			Text: base64Data,
-		})
+		contents = append(contents, &mcp.TextContent{Text: base64.StdEncoding.EncodeToString(imageData)})
 	}
-
 	return &mcp.CallToolResult{Content: contents}
 }
 
-// buildRenderResourceURI produces an opaque identifier for the
-// EmbeddedResource. It is NOT resolvable via resources/read — this server
-// does not register a handler for the grafana:// scheme — the URI exists
-// purely to let clients/caches distinguish one render from another.
-//
-// A content-hash suffix is appended so that two renders of the same
-// dashboard with different time ranges, variables, or dimensions get
-// different URIs (otherwise clients that dedupe EmbeddedResource by URI
-// — which is spec-legal — would collapse them into one). Re-rendering
-// the exact same state produces the same URI by design, making it
-// usable as a weak cache key.
+// buildRenderResourceURI returns an opaque, non-resolvable identifier for the
+// EmbeddedResource. The content-hash suffix keeps renders of different states
+// apart for clients that dedupe resources by URI.
 func buildRenderResourceURI(args GetPanelImageParams, imageData []byte) string {
 	uid := url.PathEscape(args.DashboardUID)
 	sum := sha256.Sum256(imageData)
-	// 128 bits (32 hex chars) keeps the collision probability negligible
-	// even across millions of distinct renders — a shorter prefix would
-	// start aliasing surprisingly quickly (birthday bound on 32 bits is
-	// ~65k renders).
 	hash := hex.EncodeToString(sum[:16])
 	if args.PanelID != nil {
 		return fmt.Sprintf("grafana://render/dashboard/%s/panel/%d?h=%s", uid, *args.PanelID, hash)
@@ -420,15 +344,54 @@ func buildRenderResourceURI(args GetPanelImageParams, imageData []byte) string {
 	return fmt.Sprintf("grafana://render/dashboard/%s?h=%s", uid, hash)
 }
 
-func buildRenderURL(baseURL string, args GetPanelImageParams) (string, error) {
+// Upper bounds for caller-supplied render parameters. The dimension cap matches
+// the image renderer's default maximum viewport size.
+const (
+	defaultRenderTimeout   = 60 * time.Second
+	maxRenderTimeoutSecs   = 120
+	maxRenderDimension     = 3000
+	defaultPanelWidth      = 1000
+	defaultPanelHeight     = 750
+	defaultDashboardWidth  = 1200
+	defaultDashboardHeight = 900
+	defaultExploreWidth    = 1000
+	defaultExploreHeight   = 1000
+	defaultRenderScale     = 1
+	maxRenderScale         = 3
+)
+
+func renderTimeout(args GetPanelImageParams) time.Duration {
+	if args.Timeout == nil || *args.Timeout <= 0 {
+		return defaultRenderTimeout
+	}
+	// Clamp before converting so large values cannot overflow the Duration.
+	return time.Duration(min(*args.Timeout, maxRenderTimeoutSecs)) * time.Second
+}
+
+func buildRenderURL(baseURL string, orgID int64, args GetPanelImageParams) (string, error) {
 	// Validate that exactly one source is set.
 	hasUID := args.DashboardUID != ""
 	hasPreview := args.ProvisioningPreview != nil
-	if hasUID == hasPreview {
-		if hasUID {
-			return "", fmt.Errorf("dashboardUid and provisioningPreview are mutually exclusive; pass exactly one")
+	hasExplore := args.Explore != nil
+	sources := 0
+	for _, set := range []bool{hasUID, hasPreview, hasExplore} {
+		if set {
+			sources++
 		}
-		return "", fmt.Errorf("either dashboardUid or provisioningPreview must be set")
+	}
+	if sources != 1 {
+		if sources > 1 {
+			return "", fmt.Errorf("dashboardUid, provisioningPreview and explore are mutually exclusive; pass exactly one")
+		}
+		return "", fmt.Errorf("one of dashboardUid, provisioningPreview or explore must be set")
+	}
+	if hasExplore {
+		if args.Explore.DatasourceUID == "" {
+			return "", fmt.Errorf("explore.datasourceUid is required")
+		}
+		if args.PanelID != nil {
+			return "", fmt.Errorf("panelId cannot be used with explore")
+		}
 	}
 	if hasPreview {
 		if err := validateRepoSlug("provisioningPreview.repo", args.ProvisioningPreview.Repo); err != nil {
@@ -451,7 +414,25 @@ func buildRenderURL(baseURL string, args GetPanelImageParams) (string, error) {
 	// the same route is used for both since the preview UI handles ?panelId
 	// via the standard kiosk/viewPanel mechanism.
 	var renderPath string
-	if hasPreview {
+	if hasExplore {
+		// The renderer loads /explore in a headless browser, so the state is
+		// encoded exactly as in an explore deeplink.
+		renderPath = "/render/explore"
+		exploreParams, err := buildExploreRenderParams(args)
+		if err != nil {
+			return "", err
+		}
+		for key, values := range exploreParams {
+			for _, v := range values {
+				params.Add(key, v)
+			}
+		}
+		// Newer renderers wait for a "render done" signal that only dashboards
+		// send (behind Grafana's reportRenderBinding flag), so an Explore render
+		// would hang until it times out. Ask them to poll instead; older
+		// renderers ignore the param.
+		params.Set("forcePollingMode", "true")
+	} else if hasPreview {
 		// Repo is a single segment and gets the stricter url.PathEscape (which
 		// also encodes sub-delim characters like @, $, &, ;, =, :). For the
 		// multi-segment file path we use url.URL.EscapedPath() so structural /
@@ -480,33 +461,48 @@ func buildRenderURL(baseURL string, args GetPanelImageParams) (string, error) {
 			params.Set("panelId", strconv.Itoa(*args.PanelID))
 		}
 	}
-
-	// Set dimensions
-	width := 1000
-	height := 500
+	// Choose defaults for the view, then apply each caller override independently.
+	width, height, scale := defaultDashboardWidth, defaultDashboardHeight, defaultRenderScale
+	if hasExplore {
+		// Explore shows its query editor above the graph and scrolls inside
+		// its own container (so height=-1 doesn't help); give it room.
+		width, height = defaultExploreWidth, defaultExploreHeight
+	} else if args.PanelID != nil {
+		width, height = defaultPanelWidth, defaultPanelHeight
+	}
 	if args.Width != nil {
+		if *args.Width <= 0 {
+			return "", fmt.Errorf("width must be positive")
+		}
 		width = *args.Width
 	}
 	if args.Height != nil {
+		if *args.Height <= 0 && *args.Height != -1 {
+			return "", fmt.Errorf("height must be positive or -1 for full-page rendering")
+		}
 		height = *args.Height
+	}
+	if args.Scale != nil {
+		scale = min(max(*args.Scale, defaultRenderScale), maxRenderScale)
+	}
+	// Bound device pixels, not just CSS pixels. Full-page height is determined
+	// by the dashboard, so the response byte limit remains necessary too.
+	width = min(width, maxRenderDimension/scale)
+	if height != -1 {
+		height = min(height, maxRenderDimension/scale)
 	}
 	params.Set("width", strconv.Itoa(width))
 	params.Set("height", strconv.Itoa(height))
 
-	// Set scale
-	scale := 1
-	if args.Scale != nil && *args.Scale >= 1 && *args.Scale <= 3 {
-		scale = *args.Scale
-	}
 	params.Set("scale", strconv.Itoa(scale))
 
-	// Add time range
-	if args.TimeRange != nil {
+	// Add time range. Explore carries it inside the pane state instead.
+	if args.TimeRange != nil && !hasExplore {
 		if args.TimeRange.From != "" {
-			params.Set("from", args.TimeRange.From)
+			params.Set("from", toGrafanaTimeParam(args.TimeRange.From, false))
 		}
 		if args.TimeRange.To != "" {
-			params.Set("to", args.TimeRange.To)
+			params.Set("to", toGrafanaTimeParam(args.TimeRange.To, true))
 		}
 	}
 
@@ -516,10 +512,23 @@ func buildRenderURL(baseURL string, args GetPanelImageParams) (string, error) {
 	}
 
 	// Add dashboard variables (supports multi-value via params.Add)
-	for key, values := range args.Variables {
-		for _, v := range values {
-			params.Add(key, v)
+	if !hasExplore {
+		for key, values := range args.Variables {
+			for _, v := range values {
+				params.Add(key, v)
+			}
 		}
+	}
+
+	// Select the org to render from. The image renderer drives a headless browser
+	// whose request org is set by the backend from the targetOrgId query param;
+	// the X-Grafana-Org-Id header (set by the transport) is ignored by the render
+	// path. We deliberately use targetOrgId rather than orgId: orgId is read by
+	// the frontend, which persists an org switch via /api/user/using — that would
+	// change the user's active org for every later request. targetOrgId only
+	// scopes this single render.
+	if orgID > 0 {
+		params.Set("targetOrgId", strconv.FormatInt(orgID, 10))
 	}
 
 	// Add kiosk mode options for cleaner rendering
@@ -528,17 +537,128 @@ func buildRenderURL(baseURL string, args GetPanelImageParams) (string, error) {
 	return fmt.Sprintf("%s%s?%s", baseURL, renderPath, params.Encode()), nil
 }
 
+// buildExploreRenderParams returns the Explore URL state for an Explore render
+// or its deeplink, reusing the pane builder behind generate_deeplink.
+func buildExploreRenderParams(args GetPanelImageParams) (url.Values, error) {
+	var tr *TimeRange
+	if args.TimeRange != nil {
+		tr = &TimeRange{From: args.TimeRange.From, To: args.TimeRange.To}
+	}
+	uid := args.Explore.DatasourceUID
+	return buildExplorePanesParams(GenerateDeeplinkParams{
+		ResourceType:  "explore",
+		DatasourceUID: &uid,
+		Queries:       args.Explore.Queries,
+		TimeRange:     tr,
+	})
+}
+
+// deeplinkResolvesInRenderOrg reports whether a dashboard URL carrying no org
+// would open in renderOrg for this identity.
+//
+// The link cannot carry one: `?orgId=N` is intercepted by Grafana's global
+// OrgRedirect middleware, which persists the switch onto the user's record, and
+// neither targetOrgId (render backend only) nor X-Grafana-Org-Id (not sendable
+// by a browser) substitutes. So when the render org is not where the viewer would
+// land, omit the link rather than point it at the wrong dashboard — UIDs are
+// unique only within an org. The image is unaffected.
+//
+// A non-positive renderOrg means no org reached the render (as in buildRenderURL
+// and OrgIDRoundTripper), so it used the identity's own org and the link agrees,
+// checked without a request. Any other org needs the lookup, whether it came
+// from a per-call orgId or from the connection; a failed lookup omits the link.
+func deeplinkResolvesInRenderOrg(ctx context.Context, renderOrg int64) bool {
+	if renderOrg <= 0 {
+		return true
+	}
+	viewerOrg, err := mcpgrafana.UserPersistedOrgID(ctx)
+	if err != nil {
+		return false
+	}
+	return viewerOrg == renderOrg
+}
+
+// buildDashboardDeeplink returns the Grafana UI URL for the rendered
+// dashboard, mirroring buildRenderURL's view (panel, time range, variables)
+// so the deeplink matches the PNG.
+func buildDashboardDeeplink(baseURL string, args GetPanelImageParams) (string, error) {
+	baseURL = strings.TrimRight(baseURL, "/")
+
+	if args.Explore != nil {
+		params, err := buildExploreRenderParams(args)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s/explore?%s", baseURL, params.Encode()), nil
+	}
+
+	var uid *string
+	if args.DashboardUID != "" {
+		uid = &args.DashboardUID
+	}
+	var preview *DeeplinkProvisioningPreview
+	if args.ProvisioningPreview != nil {
+		preview = &DeeplinkProvisioningPreview{
+			Repo: args.ProvisioningPreview.Repo,
+			Path: args.ProvisioningPreview.Path,
+			Ref:  args.ProvisioningPreview.Ref,
+		}
+	}
+
+	target, err := buildDashboardTargetURL(baseURL, uid, preview)
+	if err != nil {
+		return "", err
+	}
+
+	extra := url.Values{}
+	if args.PanelID != nil {
+		extra.Set("viewPanel", strconv.Itoa(*args.PanelID))
+	}
+	if args.TimeRange != nil {
+		// Normalize RFC 3339 to epoch ms for Grafana's Scenes URL parser.
+		if args.TimeRange.From != "" {
+			extra.Set("from", toGrafanaTimeParam(args.TimeRange.From, false))
+		}
+		if args.TimeRange.To != "" {
+			extra.Set("to", toGrafanaTimeParam(args.TimeRange.To, true))
+		}
+	}
+	for key, values := range args.Variables {
+		for _, v := range values {
+			extra.Add(key, v)
+		}
+	}
+
+	if len(extra) == 0 {
+		return target, nil
+	}
+	separator := "?"
+	if strings.Contains(target, "?") {
+		separator = "&"
+	}
+	return target + separator + extra.Encode(), nil
+}
+
 var GetPanelImage = mcpgrafana.MustTool(
 	"get_panel_image",
-	"Render a Grafana dashboard panel or full dashboard as a PNG image. Returns the image as base64 encoded data. Requires the Grafana Image Renderer service to be installed. "+
-		"Either dashboardUid (for stored dashboards) or provisioningPreview (for dashboards staged on a provisioning repository branch, e.g. a git-sync PR) must be supplied. "+
-		"Use this for generating visual snapshots of dashboards for reports, alerts, or presentations.",
+	"Render a Grafana dashboard panel, full dashboard or Explore view as a PNG image. Returns the image as base64 encoded data; outputFormat selects image (default), resource, both, or text_base64 (plain-text base64 for writing the PNG to disk). Requires the Grafana Image Renderer service to be installed. "+
+		"Exactly one of dashboardUid (for stored dashboards), provisioningPreview (for dashboards staged on a provisioning repository branch, e.g. a git-sync PR) or explore (an ad-hoc datasource query rendered in Explore, no saved dashboard needed) must be supplied. "+
+		fmt.Sprintf("Defaults in CSS pixels: panel %dx%d, dashboard %dx%d, Explore %dx%d. Scale defaults to %d for all views and is clamped to %d-%d. Use this for generating visual snapshots of dashboards for reports, alerts, or presentations.",
+			defaultPanelWidth, defaultPanelHeight, defaultDashboardWidth, defaultDashboardHeight, defaultExploreWidth, defaultExploreHeight, defaultRenderScale, defaultRenderScale, maxRenderScale),
 	getPanelImage,
-	mcp.WithTitleAnnotation("Get panel or dashboard image"),
-	mcp.WithIdempotentHintAnnotation(true),
-	mcp.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithTitleAnnotation("Get panel or dashboard image"),
+	mcpgrafana.WithIdempotentHintAnnotation(true),
+	mcpgrafana.WithUIResource(mcpgrafana.PanelViewerResourceURI),
+	mcpgrafana.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithDestructiveHintAnnotation(false),
+	mcpgrafana.WithOpenWorldHintAnnotation(false),
+	mcpgrafana.RequiresPermissions("dashboards:read"),
+	mcpgrafana.RequiresPermissions(datasourceQuery...),
+	// explore renders /explore; provisioningPreview renders a repository preview.
+	mcpgrafana.RequiresPermissions("datasources:explore", "provisioning.repositories:read"),
 )
 
-func AddRenderingTools(mcp *server.MCPServer) {
-	GetPanelImage.Register(mcp)
+func AddRenderingTools(s *mcp.Server, appTools ...mcpgrafana.Tool) {
+	GetPanelImage.Register(s)
+	AddAppTool(s, appTools...)
 }

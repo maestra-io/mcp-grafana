@@ -12,7 +12,7 @@ import (
 
 	"github.com/grafana/grafana-openapi-client-go/models"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
-	mcpgrafana "github.com/grafana/mcp-grafana"
+	mcpgrafana "github.com/grafana/mcp-grafana/v2"
 )
 
 // openSearchBackend handles queries to an OpenSearch datasource via the
@@ -23,6 +23,8 @@ type openSearchBackend struct {
 	baseURL         string
 	datasourceUID   string
 	configuredIndex string
+	timeField       string
+	logs            esLogFields
 }
 
 func newOpenSearchBackend(ctx context.Context, ds *models.DataSource) (*openSearchBackend, error) {
@@ -35,8 +37,9 @@ func newOpenSearchBackend(ctx context.Context, ds *models.DataSource) (*openSear
 	}
 
 	client := &http.Client{
-		Transport: transport,
-		Timeout:   30 * time.Second,
+		Transport:     transport,
+		Timeout:       30 * time.Second,
+		CheckRedirect: refuseRedirect,
 	}
 
 	// The OpenSearch plugin stores the index pattern in jsonData.database,
@@ -53,7 +56,13 @@ func newOpenSearchBackend(ctx context.Context, ds *models.DataSource) (*openSear
 		baseURL:         baseURL,
 		datasourceUID:   ds.UID,
 		configuredIndex: configuredIndex,
+		timeField:       timeFieldFromDataSource(ds),
+		logs:            logFieldsFromDataSource(ds),
 	}, nil
+}
+
+func (b *openSearchBackend) logFields() esLogFields {
+	return b.logs
 }
 
 // indexMatchesPattern reports whether the given index is compatible with the
@@ -77,7 +86,7 @@ func indexMatchesPattern(pattern, index string) bool {
 
 // Search executes a search query against an OpenSearch datasource using
 // the Grafana /api/ds/query endpoint with the OpenSearch plugin's query model.
-func (b *openSearchBackend) Search(ctx context.Context, index, query string, startTime, endTime *time.Time, limit int) ([]ElasticsearchDocument, error) {
+func (b *openSearchBackend) Search(ctx context.Context, index, query string, startTime, endTime time.Time, limit int) ([]ElasticsearchDocument, error) {
 	// Validate the requested index against the datasource's configured index pattern.
 	// The OpenSearch plugin always searches within the configured index, so requests
 	// for incompatible indices would silently return no results.
@@ -87,12 +96,12 @@ func (b *openSearchBackend) Search(ctx context.Context, index, query string, sta
 
 	// Determine time range
 	from := time.Now().Add(-10 * 365 * 24 * time.Hour) // Default: 10 years ago
-	if startTime != nil {
-		from = *startTime
+	if !startTime.IsZero() {
+		from = startTime
 	}
 	to := time.Now()
-	if endTime != nil {
-		to = *endTime
+	if !endTime.IsZero() {
+		to = endTime
 	}
 
 	// Use the user's query as-is. The OpenSearch plugin searches within the
@@ -112,7 +121,7 @@ func (b *openSearchBackend) Search(ctx context.Context, index, query string, sta
 		"query":           luceneQuery,
 		"queryType":       "lucene",
 		"luceneQueryType": "RawDocument",
-		"timeField":       "@timestamp",
+		"timeField":       b.timeField,
 		"metrics": []map[string]interface{}{
 			{
 				"id":   "1",
@@ -126,7 +135,7 @@ func (b *openSearchBackend) Search(ctx context.Context, index, query string, sta
 		"format":     "table",
 	})
 
-	result, err := doDSQueryWithLimit(ctx, b.httpClient, b.baseURL, payload, 48*1024*1024)
+	result, err := doDSQueryWithLimit(ctx, b.httpClient, b.baseURL, payload, rawDocumentResponseLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -139,16 +148,24 @@ func (b *openSearchBackend) Search(ctx context.Context, index, query string, sta
 		return nil, fmt.Errorf("opensearch query error: %s", queryResult.Error.Error())
 	}
 
-	return framesToDocuments(queryResult.Frames)
+	return framesToDocuments(queryResult.Frames, b.timeField, false)
 }
+
+// rawDocumentResponseLimit caps /api/ds/query responses holding raw_document
+// frames, which carry whole documents.
+const rawDocumentResponseLimit = 48 * 1024 * 1024
 
 // framesToDocuments converts the OpenSearch plugin's raw_document
 // frame response to ElasticsearchDocument objects.
 //
 // The OpenSearch plugin returns a single frame with one column (named after the refId)
 // of type json.RawMessage. Each value in that column is a complete document object
-// containing _id, _index, _type, @timestamp (as array), and all source fields.
-func framesToDocuments(frames data.Frames) ([]ElasticsearchDocument, error) {
+// containing _id, _index, _type, the configured time field (as array), and all source fields.
+//
+// keepUnderscored keeps unknown `_` prefixed keys as source fields. The
+// Elasticsearch plugin adds no metadata keys beyond _id, _index and _type, so
+// any other such key is a source field.
+func framesToDocuments(frames data.Frames, timeField string, keepUnderscored bool) ([]ElasticsearchDocument, error) {
 	if len(frames) == 0 {
 		return []ElasticsearchDocument{}, nil
 	}
@@ -203,24 +220,35 @@ func framesToDocuments(frames data.Frames) ([]ElasticsearchDocument, error) {
 				if f, ok := val.(float64); ok {
 					doc.Score = &f
 				}
-			case "@timestamp":
-				// The plugin returns @timestamp as an array like ["2024-01-01T00:00:00Z"]
-				if arr, ok := val.([]interface{}); ok && len(arr) > 0 {
-					if ts, ok := arr[0].(string); ok {
+			default:
+				if key == timeField {
+					// The plugin returns timestamp field as an array like ["2024-01-01T00:00:00Z"]
+					if arr, ok := val.([]interface{}); ok && len(arr) > 0 {
+						if ts, ok := arr[0].(string); ok {
+							doc.Timestamp = ts
+							doc.Source[key] = ts
+						} else {
+							doc.Source[key] = arr[0]
+						}
+					} else if ts, ok := val.(string); ok {
 						doc.Timestamp = ts
 						doc.Source[key] = ts
+					} else {
+						// e.g. epoch milliseconds; keep the value rather than dropping it.
+						doc.Source[key] = val
 					}
-				} else if ts, ok := val.(string); ok {
-					doc.Timestamp = ts
-					doc.Source[key] = ts
-				}
-			default:
-				// Skip unknown _-prefixed metadata fields
-				if strings.HasPrefix(key, "_") {
+				} else if strings.HasPrefix(key, "_") && !keepUnderscored {
+					// Skip unknown `_` prefixed metadata fields
 					continue
+				} else {
+					doc.Source[key] = val
 				}
-				doc.Source[key] = val
 			}
+		}
+		if doc.Timestamp == "" {
+			// The time field holds a number (epoch milliseconds) or is a
+			// nested path.
+			doc.Timestamp = sourceTimestamp(doc.Source, timeField)
 		}
 
 		documents = append(documents, doc)

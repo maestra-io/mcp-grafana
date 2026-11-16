@@ -3,7 +3,10 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 	"time"
@@ -137,6 +140,24 @@ func TestListCloudWatchDimensionsParams_Structure(t *testing.T) {
 	assert.Equal(t, "test-uid", params.DatasourceUID)
 	assert.Equal(t, "AWS/RDS", params.Namespace)
 	assert.Equal(t, "DatabaseConnections", params.MetricName)
+	assert.Equal(t, "ap-southeast-1", params.Region)
+	assert.Equal(t, "987654321098", params.AccountId)
+}
+
+func TestListCloudWatchDimensionValuesParams_Structure(t *testing.T) {
+	params := ListCloudWatchDimensionValuesParams{
+		DatasourceUID: "test-uid",
+		Namespace:     "AWS/RDS",
+		MetricName:    "DatabaseConnections",
+		DimensionKey:  "DBInstanceIdentifier",
+		Region:        "ap-southeast-1",
+		AccountId:     "987654321098",
+	}
+
+	assert.Equal(t, "test-uid", params.DatasourceUID)
+	assert.Equal(t, "AWS/RDS", params.Namespace)
+	assert.Equal(t, "DatabaseConnections", params.MetricName)
+	assert.Equal(t, "DBInstanceIdentifier", params.DimensionKey)
 	assert.Equal(t, "ap-southeast-1", params.Region)
 	assert.Equal(t, "987654321098", params.AccountId)
 }
@@ -359,11 +380,12 @@ func TestCloudWatchMultiFrameStatistics(t *testing.T) {
 
 func TestCloudWatchURLEncoding(t *testing.T) {
 	tests := []struct {
-		name       string
-		namespace  string
-		metricName string
-		region     string
-		wantParams map[string]string
+		name         string
+		namespace    string
+		metricName   string
+		region       string
+		dimensionKey string
+		wantParams   map[string]string
 	}{
 		{
 			name:       "standard AWS namespace with slash",
@@ -374,6 +396,19 @@ func TestCloudWatchURLEncoding(t *testing.T) {
 				"namespace":  "AWS/EC2",
 				"metricName": "CPUUtilization",
 				"region":     "us-east-1",
+			},
+		},
+		{
+			name:         "dimension key with spaces for dimension-values lookup",
+			namespace:    "Custom Namespace",
+			metricName:   "My Metric",
+			region:       "eu-west-1",
+			dimensionKey: "Instance Name",
+			wantParams: map[string]string{
+				"namespace":    "Custom Namespace",
+				"metricName":   "My Metric",
+				"region":       "eu-west-1",
+				"dimensionKey": "Instance Name",
 			},
 		},
 		{
@@ -408,6 +443,9 @@ func TestCloudWatchURLEncoding(t *testing.T) {
 			params.Set("metricName", tt.metricName)
 			if tt.region != "" {
 				params.Set("region", tt.region)
+			}
+			if tt.dimensionKey != "" {
+				params.Set("dimensionKey", tt.dimensionKey)
 			}
 
 			encoded := params.Encode()
@@ -518,4 +556,32 @@ func TestGenerateCloudWatchEmptyResultHints(t *testing.T) {
 	assert.Contains(t, hintsStr, "list_cloudwatch_namespaces")
 	assert.Contains(t, hintsStr, "list_cloudwatch_metrics")
 	assert.Contains(t, hintsStr, "list_cloudwatch_dimensions")
+}
+
+func TestCloudWatchClient_QuerySendsPercentileStatistic(t *testing.T) {
+	var gotQuery map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Queries []map[string]any `json:"queries"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		require.Len(t, payload.Queries, 1)
+		gotQuery = payload.Queries[0]
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":{}}`))
+	}))
+	defer server.Close()
+
+	client := &cloudWatchClient{httpClient: server.Client(), baseURL: server.URL}
+	now := time.Now()
+	_, err := client.query(context.Background(), CloudWatchQueryParams{
+		DatasourceUID: "cw",
+		Namespace:     "AWS/ApplicationELB",
+		MetricName:    "TargetResponseTime",
+		Statistic:     "p99.9",
+		Region:        "us-east-1",
+	}, now.Add(-time.Hour), now)
+	require.NoError(t, err)
+
+	assert.Equal(t, "p99.9", gotQuery["statistic"])
 }
