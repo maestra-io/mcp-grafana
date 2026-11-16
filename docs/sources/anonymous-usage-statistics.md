@@ -22,7 +22,7 @@ To preserve anonymity, the emitted data describes the *shape* of usage only. Thi
 Nothing an MCP client reports about itself - things like name and version - is collected. Any other value that comes from outside the binary is reduced to a fixed vocabulary before being emitted, so we don't emit a potentially-identifying value.
 
 {{< admonition type="note" >}}
-Usage statistics reporting is **enabled by default**. To disable reporting explicitly, refer to [Opt out](#opt-out).
+Usage statistics reporting is **disabled by default** in the maestra-io fork (upstream enables it). To turn it on, set `--usage-stats=enabled` or `GRAFANA_USAGE_STATS=enabled`.
 {{< /admonition >}}
 
 ## Before you begin

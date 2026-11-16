@@ -175,6 +175,7 @@ var rbacFixtures = map[string]rbacFixture{
 			return map[string]any{"uid": uid, "name": uid}
 		},
 	},
+	"alerting_manage_rules":   {skip: "fork alias of alerting_rules_read/_write; their fixtures cover the same permissions"},
 	"alerting_rules_read":     {args: map[string]any{"operation": "list"}},
 	"alerting_rules_write":    {args: map[string]any{"operation": "delete"}, setup: rbacAlertRule},
 	"alerting_silences_read":  {args: map[string]any{"operation": "list"}},

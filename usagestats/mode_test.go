@@ -79,9 +79,11 @@ func TestResolveMode(t *testing.T) {
 	}
 }
 
-func TestDefaultModeIsEnabled(t *testing.T) {
-	assert.Equal(t, ModeEnabled, DefaultMode)
-	assert.Equal(t, ModeEnabled, ResolveMode("", false, "", ""))
+// TestDefaultModeIsDisabled: the fork reports nothing without an explicit opt-in.
+func TestDefaultModeIsDisabled(t *testing.T) {
+	assert.Equal(t, ModeDisabled, DefaultMode)
+	assert.Equal(t, ModeDisabled, ResolveMode("", false, "", ""))
+	assert.Equal(t, ModeEnabled, ResolveMode("", false, "enabled", ""))
 }
 
 // TestZeroConfigIsInert: Mode is a string, so a Config built without one has

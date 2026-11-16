@@ -417,6 +417,10 @@ type UpdateDashboardParams struct {
 	Message   string `json:"message,omitempty" jsonschema:"description=Set a commit message for the version history"`
 	Overwrite bool   `json:"overwrite,omitempty" jsonschema:"description=Overwrite the dashboard if it exists. Otherwise create one"`
 	UserID    int64  `json:"userId,omitempty" jsonschema:"description=ID of the user making the change"`
+
+	// Caller metadata from the Kubernetes object form (fork), carried to the v2 write.
+	k8sAnnotations map[string]interface{}
+	k8sLabels      map[string]interface{}
 }
 
 // updateDashboard intelligently handles dashboard updates using either full JSON or patch operations.
@@ -615,17 +619,22 @@ const (
 // setDashboardAnnotation sets a metadata annotation on a k8s dashboard object,
 // creating the metadata/annotations maps if needed.
 func setDashboardAnnotation(obj map[string]interface{}, key, value string) {
+	setDashboardMetadataEntry(obj, "annotations", key, value)
+}
+
+// setDashboardMetadataEntry sets metadata.<field>[key] (annotations or labels).
+func setDashboardMetadataEntry(obj map[string]interface{}, field, key string, value interface{}) {
 	metadata, ok := obj["metadata"].(map[string]interface{})
 	if !ok {
 		metadata = map[string]interface{}{}
 		obj["metadata"] = metadata
 	}
-	annotations, ok := metadata["annotations"].(map[string]interface{})
+	entries, ok := metadata[field].(map[string]interface{})
 	if !ok {
-		annotations = map[string]interface{}{}
-		metadata["annotations"] = annotations
+		entries = map[string]interface{}{}
+		metadata[field] = entries
 	}
-	annotations[key] = value
+	entries[key] = value
 }
 
 // applyV2WriteMetadata applies the supplementary update_dashboard parameters that
@@ -633,6 +642,12 @@ func setDashboardAnnotation(obj map[string]interface{}, key, value string) {
 // dashboard, and message records a version-history note (the app-platform
 // equivalents of the legacy save command fields).
 func applyV2WriteMetadata(obj map[string]interface{}, args UpdateDashboardParams) {
+	for k, v := range args.k8sAnnotations {
+		setDashboardMetadataEntry(obj, "annotations", k, v)
+	}
+	for k, v := range args.k8sLabels {
+		setDashboardMetadataEntry(obj, "labels", k, v)
+	}
 	if args.FolderUID != "" {
 		setDashboardAnnotation(obj, annoKeyFolder, args.FolderUID)
 	}
@@ -757,7 +772,8 @@ func preferredV2Version(versions []string) string {
 // "dashboard.grafana.app/<ver>", "metadata": {...}, "spec": {...}}, i.e. what
 // the apiserver returns) and rewrites it into the body form upstream expects:
 // the spec becomes the dashboard, metadata.name the uid and the
-// grafana.app/folder annotation the folder, unless the caller set them.
+// grafana.app/folder annotation the folder, unless the caller set them; the
+// other metadata annotations and labels are kept for the v2 write.
 // Anything else is returned unchanged.
 func unwrapKubernetesDashboardObject(args UpdateDashboardParams) UpdateDashboardParams {
 	apiVersion, _ := args.Dashboard["apiVersion"].(string)
@@ -780,6 +796,10 @@ func unwrapKubernetesDashboardObject(args UpdateDashboardParams) UpdateDashboard
 	}
 	if args.FolderUID == "" {
 		args.FolderUID = k8sNestedString(args.Dashboard, "metadata", "annotations", "grafana.app/folder")
+	}
+	if metadata, ok := args.Dashboard["metadata"].(map[string]interface{}); ok {
+		args.k8sAnnotations, _ = metadata["annotations"].(map[string]interface{})
+		args.k8sLabels, _ = metadata["labels"].(map[string]interface{})
 	}
 	args.Dashboard = dash
 	return args

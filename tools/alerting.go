@@ -71,6 +71,7 @@ func AddAlertingTools(s *mcp.Server, writeEnabled func(name string) bool) {
 	if writeEnabled(AlertRulesWrite.Tool.Name) {
 		AlertRulesWrite.Register(s)
 	}
+	addAlertingCompatTools(s, writeEnabled(AlertRulesWrite.Tool.Name))
 	ManageRouting.Register(s)
 	if writeEnabled(AlertRoutingWrite.Tool.Name) {
 		AlertRoutingWrite.Register(s)

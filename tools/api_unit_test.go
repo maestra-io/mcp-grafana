@@ -436,3 +436,24 @@ func TestAPIRequest_HTTPErrorStatus(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "Not found", data["message"])
 }
+
+// TestAPIRequestReadOnly_DeniesSnapshotDelete: the read-only variants refuse
+// Grafana's state-changing GET /api/snapshots-delete/:key in any spelling,
+// before any request is sent.
+func TestAPIRequestReadOnly_DeniesSnapshotDelete(t *testing.T) {
+	called := false
+	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+	defer ts.Close()
+	ctx := apiTestContext(t, ts.URL)
+
+	for _, ep := range []string{"/api/snapshots-delete/k", "/api//snapshots-delete/k", "/api/x/../snapshots-delete/k", "/API/Snapshots-Delete/k", "/api/snapshots%2Ddelete/k?a=1"} {
+		_, err := apiRequestReadOnlyGetOnly(ctx, APIRequestReadOnlyGetOnlyParams{Endpoint: ep})
+		assert.Error(t, err, ep)
+		_, err = apiRequestReadOnly(ctx, APIRequestReadOnlyParams{Endpoint: ep})
+		assert.Error(t, err, ep)
+	}
+	assert.False(t, called, "a denied endpoint reached Grafana")
+
+	_, err := apiRequestReadOnlyGetOnly(ctx, APIRequestReadOnlyGetOnlyParams{Endpoint: "/api/snapshots"})
+	assert.NoError(t, err)
+}

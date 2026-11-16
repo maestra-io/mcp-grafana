@@ -16,6 +16,16 @@ Merged upstream v2.3.0 into the fork. Fork features kept on top of upstream:
 - `get_tempo_trace` accepts both upstream parameters (`datasourceUid`, `start`, `end`, `focus_span_id`) and the fork's (`data_source_uid`, `start_rfc_3339`, `end_rfc_3339`); the fork's select the Tempo HTTP API path that returns OTLP-JSON and works for VictoriaTraces.
 - `update_dashboard` accepts the full Kubernetes object form of a dashboard (`apiVersion: dashboard.grafana.app/<ver>`, `metadata`, `spec`) and unwraps it into upstream's v2 path (`metadata.name` → uid, `grafana.app/folder` → folder). Upstream resolves the apiserver namespace from `/api/frontend/settings`, which replaces the fork's `GRAFANA_DASHBOARD_NAMESPACE`.
 - The OnCall `GRAFANA_ONCALL_TOKEN` env fallback is not used for a request-selected Grafana URL override (same rule as the service account token); the `X-Grafana-OnCall-Token` header still applies.
+- Anonymous usage statistics (new upstream in 2.x) are **disabled by default**; opt in with `--usage-stats=enabled` or `GRAFANA_USAGE_STATS=enabled`. Upstream reports to stats.grafana.org unless told not to.
+- `alerting_manage_rules` remains as an alias with its old parameters: read-only (list, get, versions) by default under `--disable-write`, read-write (also create, update, delete) when `alerting_rules_write` is registered. New callers use `alerting_rules_read` / `alerting_rules_write` and `alerting_silences_read` / `alerting_silences_write`.
+- `update_dashboard` in the Kubernetes object form keeps the caller's other `metadata.annotations` and `metadata.labels` on the v2 write.
+- The read-only `grafana_api_request` variants refuse `/api/snapshots-delete/…`, which Grafana serves as a deleting GET.
+
+### Removed or changed upstream (no fork alias)
+
+- Sift tools (`get_sift_analysis`, `get_sift_investigation`, `list_sift_investigations`, `find_error_pattern_logs`, `find_slow_requests`) are removed upstream. They need the Grafana Cloud ML app (`grafana-ml-app`), which grafana.maestra.io does not have, so they never worked here.
+- Under `--disable-write`, upstream's write gate also hides `query_clickhouse` / `query_sql` (until `--enable-query`) and the OnCall alert-group actions (`acknowledge`, `unacknowledge`, `resolve`, `silence`, `unsilence`). 1.0.x kept `query_clickhouse` and those actions registered under `--disable-write`.
+- `update_dashboard` / provisioning tools: the `namespace` parameter and `GRAFANA_DASHBOARD_NAMESPACE` are gone; the namespace is resolved from `/api/frontend/settings`.
 
 ### Added (fork)
 

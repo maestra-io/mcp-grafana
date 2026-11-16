@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 
 	"github.com/itchyny/gojq"
@@ -62,7 +63,24 @@ func apiRequest(ctx context.Context, args APIRequestParams) (*APIRequestResult, 
 	return doAPIRequest(ctx, args.Endpoint, args.Method, args.Body, args.Headers, args.JQ)
 }
 
+// readOnlyDenied reports endpoints the read-only variants refuse although a
+// GET reaches them (fork): Grafana deletes a snapshot on
+// GET /api/snapshots-delete/:deleteKey.
+func readOnlyDenied(endpoint string) error {
+	p := endpoint
+	if u, err := url.Parse(endpoint); err == nil {
+		p = u.Path
+	}
+	if strings.HasPrefix(strings.ToLower(path.Clean("/"+p))+"/", "/api/snapshots-delete/") {
+		return fmt.Errorf("endpoint %s changes state and is not allowed in read-only mode", endpoint)
+	}
+	return nil
+}
+
 func apiRequestReadOnly(ctx context.Context, args APIRequestReadOnlyParams) (*APIRequestResult, error) {
+	if err := readOnlyDenied(args.Endpoint); err != nil {
+		return nil, err
+	}
 	method := strings.ToUpper(args.Method)
 	if method == "" {
 		method = http.MethodGet
@@ -80,6 +98,9 @@ func apiRequestReadOnly(ctx context.Context, args APIRequestReadOnlyParams) (*AP
 }
 
 func apiRequestReadOnlyGetOnly(ctx context.Context, args APIRequestReadOnlyGetOnlyParams) (*APIRequestResult, error) {
+	if err := readOnlyDenied(args.Endpoint); err != nil {
+		return nil, err
+	}
 	method := strings.ToUpper(args.Method)
 	if method == "" {
 		method = http.MethodGet

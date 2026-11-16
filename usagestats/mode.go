@@ -25,8 +25,10 @@ const (
 )
 
 // DefaultMode is the mode used when neither the flag nor the environment
-// variable selects one.
-const DefaultMode = ModeEnabled
+// variable selects one. The maestra-io fork reports nothing unless asked:
+// upstream defaults to enabled, a vendor egress our audit trail must not get
+// from an env-less run.
+const DefaultMode = ModeDisabled
 
 const (
 	// ModeEnvVar selects the reporting mode. The --usage-stats flag wins over it.

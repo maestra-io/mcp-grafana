@@ -99,3 +99,42 @@ func TestUpdateDashboard_KubernetesObjectFormCreatesV2(t *testing.T) {
 	assert.Equal(t, "t", spec["title"])
 	assert.NotContains(t, spec, "uid")
 }
+
+// TestUpdateDashboard_KubernetesObjectFormKeepsMetadata: caller annotations and
+// labels of the object form reach the v2 write next to the folder annotation,
+// and the caller's maps are not mutated.
+func TestUpdateDashboard_KubernetesObjectFormKeepsMetadata(t *testing.T) {
+	var posted map[string]interface{}
+	ts := httptest.NewServer(withFrontendSettings("default", func(w http.ResponseWriter, r *http.Request) {
+		if serveDashboardDiscovery(w, r, "v1beta1", "v2beta1") {
+			return
+		}
+		if r.Method == http.MethodPost {
+			_ = json.NewDecoder(r.Body).Decode(&posted)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"metadata": map[string]interface{}{"name": "my-dash"}})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	k8s := &mcpgrafana.KubernetesClient{BaseURL: ts.URL, HTTPClient: ts.Client()}
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{URL: ts.URL})
+	ctx = mcpgrafana.WithKubernetesClient(ctx, k8s)
+
+	obj := k8sDashboardObject(map[string]interface{}{"title": "t", "elements": map[string]interface{}{}})
+	meta := obj["metadata"].(map[string]interface{})
+	callerAnn := map[string]interface{}{"foo": "bar"}
+	meta["annotations"] = callerAnn
+	meta["labels"] = map[string]interface{}{"team": "infra"}
+
+	_, err := updateDashboard(ctx, UpdateDashboardParams{Dashboard: obj, FolderUID: "f9", Message: "m"})
+	require.NoError(t, err)
+	require.NotNil(t, posted)
+	assert.Equal(t, "bar", k8sNestedString(posted, "metadata", "annotations", "foo"))
+	assert.Equal(t, "f9", k8sNestedString(posted, "metadata", "annotations", "grafana.app/folder"))
+	assert.Equal(t, "m", k8sNestedString(posted, "metadata", "annotations", "grafana.app/message"))
+	assert.Equal(t, "infra", k8sNestedString(posted, "metadata", "labels", "team"))
+	assert.Equal(t, map[string]interface{}{"foo": "bar"}, callerAnn, "caller annotations must not be mutated")
+}
