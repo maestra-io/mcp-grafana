@@ -1,23 +1,8 @@
 package tools
 
-import "encoding/json"
-
 // OnCall response types used by MCP tools.
 // These types provide a unified interface regardless of whether the data
 // comes from the IRM plugin proxy (internal API) or the public OnCall API.
-
-// LastAlertPayload is the raw integration-specific payload of the most recent
-// alert in an alert group. The shape varies by source (Alertmanager,
-// Prometheus, webhook, etc.); keep as RawMessage to avoid lossy parsing.
-type LastAlertPayload = json.RawMessage
-
-// LastAlert is the most recent individual alert in an alert group, returned by
-// the OnCall detail endpoint.
-type LastAlert struct {
-	ID        string           `json:"id,omitempty"`
-	CreatedAt string           `json:"created_at,omitempty"`
-	Payload   LastAlertPayload `json:"payload,omitempty"`
-}
 
 // OnCallAlertGroup represents an alert group returned by MCP tools.
 type OnCallAlertGroup struct {
@@ -36,7 +21,24 @@ type OnCallAlertGroup struct {
 	Team           string            `json:"team,omitempty"`
 	AcknowledgedBy string            `json:"acknowledged_by,omitempty"`
 	ResolvedBy     string            `json:"resolved_by,omitempty"`
-	LastAlert      *LastAlert        `json:"last_alert,omitempty"`
+	// LastAlert is the most recent alert in the group, including its raw
+	// payload. Only populated by get_alert_group on the public OnCall API
+	// path; the IRM proxy's internal endpoint does not expose it.
+	LastAlert *OnCallLastAlert `json:"last_alert,omitempty"`
+}
+
+// OnCallLastAlert is the most recent alert in an alert group.
+//
+// Payload is decoded as an arbitrary JSON object rather than a typed struct
+// because its contents are entirely determined by the integration that sent
+// the alert. Keeping it untyped preserves source-specific fields an agent
+// needs to correlate recurring alerts, such as Sentry's
+// payload.data.event.hashes[0] or Alertmanager's payload.alerts[0].fingerprint.
+type OnCallLastAlert struct {
+	ID           string         `json:"id"`
+	AlertGroupID string         `json:"alert_group_id"`
+	CreatedAt    string         `json:"created_at"`
+	Payload      map[string]any `json:"payload,omitempty"`
 }
 
 // OnCallUser represents an OnCall user returned by MCP tools.
@@ -95,10 +97,9 @@ type onCallAlertGroupInternal struct {
 	ResolvedAt          string            `json:"resolved_at"`
 	AcknowledgedAt      string            `json:"acknowledged_at"`
 	SilencedAt          string            `json:"silenced_at"`
-	RouteID             string            `json:"route_id"`
-	AcknowledgedBy      string            `json:"acknowledged_by"`
-	ResolvedBy          string            `json:"resolved_by"`
-	LastAlert           *LastAlert        `json:"last_alert"`
+	RouteID             any               `json:"route_id"`
+	AcknowledgedBy      any               `json:"acknowledged_by"`
+	ResolvedBy          any               `json:"resolved_by"`
 	AlertReceiveChannel any               `json:"alert_receive_channel"`
 	Team                any               `json:"team"`
 	Labels              any               `json:"labels"`
@@ -203,10 +204,6 @@ func (ag *onCallAlertGroupInternal) toOnCallAlertGroup() *OnCallAlertGroup {
 		ResolvedAt:     ag.ResolvedAt,
 		AcknowledgedAt: ag.AcknowledgedAt,
 		SilencedAt:     ag.SilencedAt,
-		RouteID:        ag.RouteID,
-		AcknowledgedBy: ag.AcknowledgedBy,
-		ResolvedBy:     ag.ResolvedBy,
-		LastAlert:      ag.LastAlert,
 		Labels:         ag.Labels,
 		Permalinks:     ag.Permalinks,
 	}
@@ -221,6 +218,12 @@ func (ag *onCallAlertGroupInternal) toOnCallAlertGroup() *OnCallAlertGroup {
 	if t, ok := ag.Team.(string); ok {
 		result.Team = t
 	}
+	// Detail fields kept by the maestra-io fork. Typed loosely so an
+	// unexpected shape on the internal API drops the field instead of
+	// failing the whole decode.
+	result.RouteID, _ = ag.RouteID.(string)
+	result.AcknowledgedBy, _ = ag.AcknowledgedBy.(string)
+	result.ResolvedBy, _ = ag.ResolvedBy.(string)
 	return result
 }
 

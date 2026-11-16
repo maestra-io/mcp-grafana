@@ -1,0 +1,546 @@
+package tools
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	mcpgrafana "github.com/grafana/mcp-grafana/v2"
+	"github.com/grafana/mcp-grafana/v2/internal/datasource"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
+)
+
+// DefaultTempoSearchLimit is the default number of traces returned by a
+// query_tempo_traces call when the caller does not specify a limit.
+const DefaultTempoSearchLimit = 20
+
+// tempoResponseLimit caps how much of a Tempo API response body we read, to
+// avoid loading an unbounded trace into memory.
+const tempoResponseLimit = 1024 * 1024 * 10 // 10MB
+
+// addVictoriaTempoTools registers the fork's Tempo-HTTP-API tools
+// (query_tempo_traces, list_tempo_tag_names, list_tempo_tag_values) next to
+// upstream's /api/ds/query based ones. They call the datasource proxy directly,
+// which is what VictoriaTraces' Tempo-compatible endpoint needs.
+// get_tempo_trace is a single tool shared with upstream: see getTempoTrace.
+func addVictoriaTempoTools(s *mcp.Server) {
+	QueryTempoTraces.Register(s)
+	ListTempoTagNames.Register(s)
+	ListTempoTagValues.Register(s)
+}
+
+// tempoClient talks to a Tempo-compatible HTTP API (Grafana Tempo or
+// VictoriaTraces' `/select/tempo` endpoint) through the Grafana datasource
+// proxy. It mirrors the Loki client: BuildTransport applies auth/TLS and the
+// fallback transport handles /proxy vs /resources deployment differences.
+type tempoClient struct {
+	httpClient *http.Client
+	baseURL    string
+}
+
+func newTempoClient(ctx context.Context, uid string) (*tempoClient, error) {
+	// First check if the datasource exists.
+	if _, err := datasource.ByUID(ctx, uid); err != nil {
+		return nil, err
+	}
+
+	cfg := mcpgrafana.GrafanaConfigFromContext(ctx)
+	resourcesBase, proxyBase := datasourceProxyPaths(uid)
+	baseURL := cfg.URL + proxyBase
+
+	transport, err := mcpgrafana.BuildTransport(&cfg, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create custom transport: %w", err)
+	}
+
+	// Wrap with fallback transport: try /proxy first, fall back to /resources
+	// on 403/500 for compatibility with different managed Grafana deployments.
+	rt := newDatasourceFallbackTransport(transport, proxyBase, resourcesBase)
+
+	return &tempoClient{
+		httpClient: &http.Client{Transport: rt},
+		baseURL:    baseURL,
+	}, nil
+}
+
+// get issues a GET against a Tempo API path (relative to the datasource proxy
+// base) and returns the raw response body. It always requests JSON so the
+// trace-by-id endpoint returns OTLP-JSON rather than protobuf.
+func (c *tempoClient) get(ctx context.Context, urlPath string, params url.Values) ([]byte, error) {
+	u, err := url.Parse(c.baseURL + urlPath)
+	if err != nil {
+		return nil, fmt.Errorf("parsing URL: %w", err)
+	}
+	if params != nil {
+		u.RawQuery = params.Encode()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("executing request: %w", err)
+	}
+	defer func() {
+		_ = resp.Body.Close() //nolint:errcheck
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, tempoResponseLimit))
+		return nil, fmt.Errorf("tempo API returned status code %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, tempoResponseLimit))
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+	return body, nil
+}
+
+// ---------------------------------------------------------------------------
+// query_tempo_traces — TraceQL search
+// ---------------------------------------------------------------------------
+
+const queryTempoTracesToolPrompt = `
+Searches a Tempo (or VictoriaTraces Tempo-compatible) datasource for traces matching a TraceQL query.
+Returns a list of matching traces with their trace ID, root service, root span name, start time, and duration in milliseconds.
+Fetch a trace by its ID to inspect the full span tree.
+
+TraceQL examples:
+- '{}' — all traces (default)
+- '{ resource.service.name = "mcp" }' — traces with a span from service "mcp"
+- '{ duration > 200ms }' — traces with a span longer than 200ms
+- '{ resource.service.name = "mcp" && span.http.status_code >= 500 }' — combine matchers with &&
+
+If the time range is not provided, it defaults to the last hour. List the tag names and values to discover available attributes.
+`
+
+var QueryTempoTraces = mcpgrafana.MustTool(
+	"query_tempo_traces",
+	queryTempoTracesToolPrompt,
+	queryTempoTraces,
+	mcpgrafana.WithTitleAnnotation("Query Tempo traces"),
+	mcpgrafana.WithIdempotentHintAnnotation(true),
+	mcpgrafana.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithDestructiveHintAnnotation(false),
+	mcpgrafana.WithOpenWorldHintAnnotation(false),
+	mcpgrafana.RequiresPermissions(datasourceQuery...),
+)
+
+type QueryTempoTracesParams struct {
+	DataSourceUID string `json:"data_source_uid" jsonschema:"required,description=The UID of the Tempo datasource to query"`
+	Query         string `json:"query,omitempty" jsonschema:"description=A TraceQL query (defaults to {} which matches all traces)"`
+	Limit         int    `json:"limit,omitempty" jsonschema:"description=Maximum number of traces to return (default 20)"`
+	StartRFC3339  string `json:"start_rfc_3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format (defaults to 1 hour ago)"`
+	EndRFC3339    string `json:"end_rfc_3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format (defaults to now)"`
+}
+
+// tempoSearchResponse is the relevant subset of Tempo's /api/search response.
+type tempoSearchResponse struct {
+	Traces []tempoTraceSummaryRaw `json:"traces"`
+}
+
+type tempoTraceSummaryRaw struct {
+	TraceID           string   `json:"traceID"`
+	RootServiceName   string   `json:"rootServiceName"`
+	RootTraceName     string   `json:"rootTraceName"`
+	StartTimeUnixNano unixNano `json:"startTimeUnixNano"`
+	DurationMs        int64    `json:"durationMs"`
+}
+
+// unixNano is a nanosecond Unix timestamp that tolerates being encoded as
+// either a JSON number or a JSON string. Grafana Tempo returns it as a string,
+// while VictoriaTraces returns it as a number at the trace-summary level (and
+// as a string inside spanSets) — so we must accept both.
+type unixNano int64
+
+func (u *unixNano) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
+	if s == "" || s == "null" {
+		*u = 0
+		return nil
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid unix-nano timestamp %q: %w", s, err)
+	}
+	*u = unixNano(n)
+	return nil
+}
+
+// TempoTraceSummary is the cleaned-up trace summary returned to the caller.
+type TempoTraceSummary struct {
+	TraceID         string `json:"traceID"`
+	RootServiceName string `json:"rootServiceName,omitempty"`
+	RootTraceName   string `json:"rootTraceName,omitempty"`
+	StartTime       string `json:"startTime,omitempty"`
+	DurationMs      int64  `json:"durationMs"`
+}
+
+func queryTempoTraces(ctx context.Context, args QueryTempoTracesParams) ([]TempoTraceSummary, error) {
+	query := stringOrDefault(args.Query, "{}")
+
+	start, end, err := tempoRFC3339Range(args.StartRFC3339, args.EndRFC3339)
+	if err != nil {
+		return nil, err
+	}
+
+	limit := args.Limit
+	if limit <= 0 {
+		limit = DefaultTempoSearchLimit
+	}
+
+	client, err := newTempoClient(ctx, args.DataSourceUID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Tempo client: %w", err)
+	}
+
+	params := url.Values{}
+	params.Set("q", query)
+	params.Set("start", strconv.FormatInt(start.Unix(), 10))
+	params.Set("end", strconv.FormatInt(end.Unix(), 10))
+	params.Set("limit", strconv.Itoa(limit))
+
+	body, err := client.get(ctx, "/api/search", params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search Tempo: %w", err)
+	}
+
+	var resp tempoSearchResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("unmarshalling Tempo search response (content: %s): %w", truncateForLog(string(body), 500), err)
+	}
+
+	summaries := make([]TempoTraceSummary, 0, len(resp.Traces))
+	for _, t := range resp.Traces {
+		summaries = append(summaries, TempoTraceSummary{
+			TraceID:         t.TraceID,
+			RootServiceName: t.RootServiceName,
+			RootTraceName:   t.RootTraceName,
+			StartTime:       formatUnixNano(int64(t.StartTimeUnixNano)),
+			DurationMs:      t.DurationMs,
+		})
+	}
+	return summaries, nil
+}
+
+// ---------------------------------------------------------------------------
+// get_tempo_trace — fetch a full trace by ID
+// ---------------------------------------------------------------------------
+
+type getTempoTraceLegacyParams struct {
+	DataSourceUID string `json:"data_source_uid" jsonschema:"required,description=The UID of the Tempo datasource to query"`
+	TraceID       string `json:"trace_id" jsonschema:"required,description=The trace ID to fetch"`
+	StartRFC3339  string `json:"start_rfc_3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format (defaults to 1 hour ago)"`
+	EndRFC3339    string `json:"end_rfc_3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format (defaults to now)"`
+}
+
+func getTempoTraceLegacy(ctx context.Context, args getTempoTraceLegacyParams) (string, error) {
+	traceID := strings.TrimSpace(args.TraceID)
+	if traceID == "" {
+		return "", fmt.Errorf("trace_id is required")
+	}
+
+	start, end, err := tempoRFC3339Range(args.StartRFC3339, args.EndRFC3339)
+	if err != nil {
+		return "", err
+	}
+
+	client, err := newTempoClient(ctx, args.DataSourceUID)
+	if err != nil {
+		return "", fmt.Errorf("failed to create Tempo client: %w", err)
+	}
+
+	params := url.Values{}
+	params.Set("start", strconv.FormatInt(start.Unix(), 10))
+	params.Set("end", strconv.FormatInt(end.Unix(), 10))
+
+	body, err := client.get(ctx, "/api/v2/traces/"+url.PathEscape(traceID), params)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch Tempo trace: %w", err)
+	}
+	return tempoTraceToJSON(body), nil
+}
+
+// tempoTraceToJSON normalizes a trace-by-id response into readable JSON.
+// Grafana Tempo honors Accept: application/json and returns JSON, but the
+// Grafana datasource proxy forwards trace-by-id requests to the backend with
+// Accept: application/protobuf, so VictoriaTraces returns OTLP protobuf — in
+// which per-span timings and IDs are binary and unreadable. We decode that to
+// OTLP-JSON so span durations/attributes are usable.
+//
+// VictoriaTraces wraps the trace in a TempoTraceByIDResponse:
+//
+//	TempoTraceByIDResponse { TempoTrace trace = 1; ... }
+//	TempoTrace             { repeated ResourceSpans resourceSpans = 1; }
+//
+// TempoTrace shares the wire format of OTLP TracesData (repeated ResourceSpans
+// at field 1), so we unwrap the outer field-1 message and decode the inner
+// bytes as TracesData. We also try the body as-is (a bare TracesData, e.g.
+// from real Grafana Tempo's protobuf form). If nothing decodes, the body is
+// returned unchanged (no regression).
+func tempoTraceToJSON(body []byte) string {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return string(body)
+	}
+	// Already JSON.
+	if trimmed[0] == '{' || trimmed[0] == '[' {
+		return string(body)
+	}
+	// Try the unwrapped inner message first (VictoriaTraces TempoTraceByIDResponse),
+	// then the raw body (bare TracesData).
+	for _, candidate := range [][]byte{protoField1Message(body), body} {
+		if candidate == nil {
+			continue
+		}
+		var td tracepb.TracesData
+		if err := proto.Unmarshal(candidate, &td); err == nil && len(td.ResourceSpans) > 0 {
+			if js, err := protojson.Marshal(&td); err == nil {
+				return string(js)
+			}
+		}
+	}
+	return string(body)
+}
+
+// protoField1Message returns the bytes of the first length-delimited field 1
+// in a protobuf message (e.g. TempoTraceByIDResponse.trace), or nil if absent.
+func protoField1Message(b []byte) []byte {
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return nil
+		}
+		b = b[n:]
+		if num == 1 && typ == protowire.BytesType {
+			v, vn := protowire.ConsumeBytes(b)
+			if vn < 0 {
+				return nil
+			}
+			return v
+		}
+		vn := protowire.ConsumeFieldValue(num, typ, b)
+		if vn < 0 {
+			return nil
+		}
+		b = b[vn:]
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// list_tempo_tag_names — discover searchable attributes
+// ---------------------------------------------------------------------------
+
+const listTempoTagNamesToolPrompt = `
+Lists the searchable tag (attribute) names available in a Tempo (or VictoriaTraces Tempo-compatible) datasource.
+Use these names to build TraceQL queries, and list the values of a tag to refine them.
+If the time range is not provided, it defaults to the last hour.
+`
+
+var ListTempoTagNames = mcpgrafana.MustTool(
+	"list_tempo_tag_names",
+	listTempoTagNamesToolPrompt,
+	listTempoTagNames,
+	mcpgrafana.WithTitleAnnotation("List Tempo tag names"),
+	mcpgrafana.WithIdempotentHintAnnotation(true),
+	mcpgrafana.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithDestructiveHintAnnotation(false),
+	mcpgrafana.WithOpenWorldHintAnnotation(false),
+	mcpgrafana.RequiresPermissions(datasourceQuery...),
+)
+
+type ListTempoTagNamesParams struct {
+	DataSourceUID string `json:"data_source_uid" jsonschema:"required,description=The UID of the Tempo datasource to query"`
+	StartRFC3339  string `json:"start_rfc_3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format (defaults to 1 hour ago)"`
+	EndRFC3339    string `json:"end_rfc_3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format (defaults to now)"`
+}
+
+// tempoTagNamesResponse is the relevant subset of Tempo's /api/v2/search/tags
+// response. Tags are grouped under scopes (resource, span, intrinsic).
+type tempoTagNamesResponse struct {
+	Scopes []struct {
+		Name string   `json:"name"`
+		Tags []string `json:"tags"`
+	} `json:"scopes"`
+}
+
+func listTempoTagNames(ctx context.Context, args ListTempoTagNamesParams) ([]string, error) {
+	start, end, err := tempoRFC3339Range(args.StartRFC3339, args.EndRFC3339)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := newTempoClient(ctx, args.DataSourceUID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Tempo client: %w", err)
+	}
+
+	params := url.Values{}
+	params.Set("start", strconv.FormatInt(start.Unix(), 10))
+	params.Set("end", strconv.FormatInt(end.Unix(), 10))
+
+	body, err := client.get(ctx, "/api/v2/search/tags", params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list Tempo tag names: %w", err)
+	}
+
+	var resp tempoTagNamesResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("unmarshalling Tempo tag names response (content: %s): %w", truncateForLog(string(body), 500), err)
+	}
+
+	// Flatten scopes into a single deduplicated, sorted list of tag names.
+	seen := make(map[string]struct{})
+	names := make([]string, 0)
+	for _, scope := range resp.Scopes {
+		for _, tag := range scope.Tags {
+			if _, ok := seen[tag]; ok {
+				continue
+			}
+			seen[tag] = struct{}{}
+			names = append(names, tag)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// ---------------------------------------------------------------------------
+// list_tempo_tag_values — discover values for a given attribute
+// ---------------------------------------------------------------------------
+
+const listTempoTagValuesToolPrompt = `
+Lists the values of a specific tag (attribute) in a Tempo (or VictoriaTraces Tempo-compatible) datasource.
+Discover tag names first. Use the values to build TraceQL queries.
+If the time range is not provided, it defaults to the last hour.
+`
+
+var ListTempoTagValues = mcpgrafana.MustTool(
+	"list_tempo_tag_values",
+	listTempoTagValuesToolPrompt,
+	listTempoTagValues,
+	mcpgrafana.WithTitleAnnotation("List Tempo tag values"),
+	mcpgrafana.WithIdempotentHintAnnotation(true),
+	mcpgrafana.WithReadOnlyHintAnnotation(true),
+	mcpgrafana.WithDestructiveHintAnnotation(false),
+	mcpgrafana.WithOpenWorldHintAnnotation(false),
+	mcpgrafana.RequiresPermissions(datasourceQuery...),
+)
+
+type ListTempoTagValuesParams struct {
+	DataSourceUID string `json:"data_source_uid" jsonschema:"required,description=The UID of the Tempo datasource to query"`
+	Tag           string `json:"tag" jsonschema:"required,description=The tag (attribute) name to list values for. Use a TraceQL-scoped identifier\\, e.g. 'resource.service.name'\\, 'span.http.status_code'\\, or an intrinsic like 'name' or 'status'"`
+	StartRFC3339  string `json:"start_rfc_3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format (defaults to 1 hour ago)"`
+	EndRFC3339    string `json:"end_rfc_3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format (defaults to now)"`
+}
+
+// tempoTagValuesResponse is the relevant subset of Tempo's
+// /api/v2/search/tag/<tag>/values response. Each value carries its type.
+type tempoTagValuesResponse struct {
+	TagValues []struct {
+		Type  string `json:"type"`
+		Value string `json:"value"`
+	} `json:"tagValues"`
+}
+
+func listTempoTagValues(ctx context.Context, args ListTempoTagValuesParams) ([]string, error) {
+	tag := strings.TrimSpace(args.Tag)
+	if tag == "" {
+		return nil, fmt.Errorf("tag is required")
+	}
+
+	start, end, err := tempoRFC3339Range(args.StartRFC3339, args.EndRFC3339)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := newTempoClient(ctx, args.DataSourceUID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Tempo client: %w", err)
+	}
+
+	params := url.Values{}
+	params.Set("start", strconv.FormatInt(start.Unix(), 10))
+	params.Set("end", strconv.FormatInt(end.Unix(), 10))
+
+	body, err := client.get(ctx, "/api/v2/search/tag/"+url.PathEscape(tag)+"/values", params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list Tempo tag values: %w", err)
+	}
+
+	var resp tempoTagValuesResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("unmarshalling Tempo tag values response (content: %s): %w", truncateForLog(string(body), 500), err)
+	}
+
+	values := make([]string, 0, len(resp.TagValues))
+	for _, v := range resp.TagValues {
+		values = append(values, v.Value)
+	}
+	return values, nil
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+// tempoRFC3339Range parses optional RFC3339 start/end strings, defaulting to the
+// last hour, and validates the resulting range.
+func tempoRFC3339Range(startRFC3339, endRFC3339 string) (time.Time, time.Time, error) {
+	parse := func(name, v string) (time.Time, error) {
+		if v = strings.TrimSpace(v); v == "" {
+			return time.Time{}, nil
+		}
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to parse %s timestamp %q: %w", name, v, err)
+		}
+		return t, nil
+	}
+	start, err := parse("start", startRFC3339)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	end, err := parse("end", endRFC3339)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	return validateTimeRange(start, end)
+}
+
+// truncateForLog bounds a string used in an error message so an unexpected
+// large response body (e.g. an HTML error page, up to tempoResponseLimit) does
+// not flood logs.
+func truncateForLog(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "... (truncated)"
+}
+
+// formatUnixNano converts a nanoseconds-since-Unix-epoch timestamp into an
+// RFC3339 string. Returns "" for non-positive values.
+func formatUnixNano(n int64) string {
+	if n <= 0 {
+		return ""
+	}
+	return time.Unix(0, n).UTC().Format(time.RFC3339)
+}

@@ -16,11 +16,13 @@ import (
 	"github.com/grafana/grafana-openapi-client-go/models"
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
-	mcpgrafana "github.com/grafana/mcp-grafana"
+	mcpgrafana "github.com/grafana/mcp-grafana/v2"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+const victoriaMetricsDatasourceType = "victoriametrics-metrics-datasource"
 
 // fakeVMServer captures the most recent /api/ds/query payload and returns a
 // canned backend.QueryDataResponse so tests can assert payload shape and response decoding
@@ -51,11 +53,11 @@ func newFakeVMServer(t *testing.T, response backend.QueryDataResponse) *fakeVMSe
 	return f
 }
 
-func newTestVMBackend(t *testing.T, server *httptest.Server) *victoriaMetricsBackend {
+func newTestVMBackend(t *testing.T, server *httptest.Server) *prometheusBackend {
 	t.Helper()
 	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{URL: server.URL})
 	ds := &models.DataSource{UID: "vm-uid", Type: victoriaMetricsDatasourceType}
-	b, err := newVictoriaMetricsBackend(ctx, "vm-uid", ds)
+	b, err := newPrometheusBackend(ctx, "vm-uid", ds)
 	require.NoError(t, err)
 	// Override baseURL on the test server (defensive — should already match).
 	b.baseURL = server.URL
@@ -101,7 +103,7 @@ func TestVictoriaMetricsBackendQuery_PayloadShape(t *testing.T) {
 
 			start := time.Unix(1700000000, 0)
 			end := time.Unix(1700003600, 0)
-			_, err := b.Query(context.Background(), `up{job="prometheus"}`, tc.queryType, start, end, tc.stepSeconds)
+			_, _, err := b.Query(context.Background(), `up{job="prometheus"}`, tc.queryType, start, end, tc.stepSeconds)
 			require.NoError(t, err)
 
 			require.NotNil(t, fake.lastPayload)
@@ -116,6 +118,7 @@ func TestVictoriaMetricsBackendQuery_PayloadShape(t *testing.T) {
 			assert.Equal(t, tc.wantRange, q["range"])
 			assert.Equal(t, tc.wantInterval, q["interval"])
 			assert.Equal(t, tc.wantIntervalMs, q["intervalMs"])
+			assert.Equal(t, float64(11000), q["maxDataPoints"])
 
 			ds := q["datasource"].(map[string]interface{})
 			assert.Equal(t, victoriaMetricsDatasourceType, ds["type"])
@@ -138,7 +141,7 @@ func TestVictoriaMetricsBackendQuery_DecodesInstantResponse(t *testing.T) {
 	}})
 	b := newTestVMBackend(t, fake.server)
 
-	v, err := b.Query(context.Background(), "up", "instant", time.Time{}, time.Unix(1700000000, 0), 0)
+	v, _, err := b.Query(context.Background(), "up", "instant", time.Time{}, time.Unix(1700000000, 0), 0)
 	require.NoError(t, err)
 
 	vec, ok := v.(model.Vector)
@@ -163,7 +166,7 @@ func TestVictoriaMetricsBackendQuery_DecodesRangeResponseAsMatrix(t *testing.T) 
 	}})
 	b := newTestVMBackend(t, fake.server)
 
-	v, err := b.Query(
+	v, _, err := b.Query(
 		context.Background(),
 		"up",
 		"range",
@@ -189,7 +192,7 @@ func TestVictoriaMetricsBackendQuery_PropagatesUpstreamError(t *testing.T) {
 	}})
 	b := newTestVMBackend(t, fake.server)
 
-	_, err := b.Query(context.Background(), "rate(", "instant", time.Time{}, time.Unix(1700000000, 0), 0)
+	_, _, err := b.Query(context.Background(), "rate(", "instant", time.Time{}, time.Unix(1700000000, 0), 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "rate: bad expression")
 }
@@ -198,7 +201,7 @@ func TestVictoriaMetricsBackendQuery_RejectsInvalidQueryType(t *testing.T) {
 	fake := newFakeVMServer(t, backend.QueryDataResponse{})
 	b := newTestVMBackend(t, fake.server)
 
-	_, err := b.Query(context.Background(), "up", "bogus", time.Time{}, time.Unix(1700000000, 0), 0)
+	_, _, err := b.Query(context.Background(), "up", "bogus", time.Time{}, time.Unix(1700000000, 0), 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid query type")
 	assert.Nil(t, fake.lastPayload, "should not hit the server with an invalid query type")
@@ -211,7 +214,7 @@ func TestVictoriaMetricsBackendQuery_DefaultsToNowWhenBothTimesZero(t *testing.T
 	b := newTestVMBackend(t, fake.server)
 
 	before := time.Now().UnixMilli()
-	_, err := b.Query(context.Background(), "up", "instant", time.Time{}, time.Time{}, 0)
+	_, _, err := b.Query(context.Background(), "up", "instant", time.Time{}, time.Time{}, 0)
 	require.NoError(t, err)
 	after := time.Now().UnixMilli()
 
@@ -226,6 +229,37 @@ func TestVictoriaMetricsBackendQuery_DefaultsToNowWhenBothTimesZero(t *testing.T
 	assert.Equal(t, from, to, "both times default to the same now() value")
 }
 
+// Fork: a start without an end reads until now instead of collapsing to a
+// zero-width window at start, and a negative step is rejected before any
+// request is sent.
+func TestVictoriaMetricsBackendQuery_StartWithoutEndReadsUntilNow(t *testing.T) {
+	fake := newFakeVMServer(t, backend.QueryDataResponse{Responses: backend.Responses{
+		"A": backend.DataResponse{Frames: data.Frames{}},
+	}})
+	b := newTestVMBackend(t, fake.server)
+
+	start := time.Now().Add(-time.Hour)
+	before := time.Now().UnixMilli()
+	_, _, err := b.Query(context.Background(), "up", "range", start, time.Time{}, 60)
+	require.NoError(t, err)
+
+	require.NotNil(t, fake.lastPayload)
+	to, err := strconv.ParseInt(fake.lastPayload["to"].(string), 10, 64)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, to, before)
+	assert.Equal(t, strconv.FormatInt(start.UnixMilli(), 10), fake.lastPayload["from"])
+}
+
+func TestVictoriaMetricsBackendQuery_RejectsNegativeStep(t *testing.T) {
+	fake := newFakeVMServer(t, backend.QueryDataResponse{})
+	b := newTestVMBackend(t, fake.server)
+
+	_, _, err := b.Query(context.Background(), "up", "range", time.Now().Add(-time.Hour), time.Now(), -5)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "stepSeconds must be >= 0")
+	assert.Nil(t, fake.lastPayload)
+}
+
 func TestVictoriaMetricsBackendQuery_HTTPError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -234,8 +268,8 @@ func TestVictoriaMetricsBackendQuery_HTTPError(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	b := newTestVMBackend(t, server)
-	_, err := b.Query(context.Background(), "up", "instant", time.Time{}, time.Unix(1700000000, 0), 0)
+	_, _, err := b.Query(context.Background(), "up", "instant", time.Time{}, time.Unix(1700000000, 0), 0)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "querying VictoriaMetrics instant")
+	assert.Contains(t, err.Error(), "querying Prometheus instant")
 	assert.Contains(t, err.Error(), "status 500")
 }

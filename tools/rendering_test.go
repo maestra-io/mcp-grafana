@@ -5,18 +5,22 @@ package tools
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	mcpgrafana "github.com/grafana/mcp-grafana"
+	mcpgrafana "github.com/grafana/mcp-grafana/v2"
 )
 
 func intPtr(i int) *int {
@@ -153,6 +157,7 @@ func TestBuildRenderURL(t *testing.T) {
 	tests := []struct {
 		name        string
 		baseURL     string
+		orgID       int64
 		args        GetPanelImageParams
 		contains    []string
 		notContains []string
@@ -166,11 +171,82 @@ func TestBuildRenderURL(t *testing.T) {
 			},
 			contains: []string{
 				"http://localhost:3000/render/d/abc123",
-				"width=1000",
-				"height=500",
+				"width=1200",
+				"height=900",
 				"scale=1",
 				"kiosk=true",
 			},
+		},
+		{
+			name:    "Explore render uses explore path with pane state",
+			baseURL: "http://localhost:3000",
+			args: GetPanelImageParams{
+				Explore: &RenderExplore{
+					DatasourceUID: "prom-uid",
+					Queries:       []map[string]interface{}{{"refId": "A", "expr": "up"}},
+				},
+				TimeRange: &RenderTimeRange{From: "now-1h", To: "now"},
+				Variables: map[string]StringOrSlice{"var-x": {"ignored"}},
+			},
+			contains: []string{
+				"http://localhost:3000/render/explore?",
+				"schemaVersion=1",
+				"panes=",
+				"prom-uid",
+				"kiosk=true",
+				"forcePollingMode=true",
+				"height=1000",
+			},
+			notContains: []string{
+				"/render/d",
+				"var-x",
+				"from=now-1h",
+			},
+		},
+		{
+			name:    "Explore render passes custom dimensions",
+			baseURL: "http://localhost:3000",
+			args: GetPanelImageParams{
+				Explore: &RenderExplore{DatasourceUID: "prom-uid"},
+				Width:   intPtr(400),
+				Height:  intPtr(200),
+				Scale:   intPtr(2),
+			},
+			contains: []string{
+				"http://localhost:3000/render/explore?",
+				"width=400",
+				"height=200",
+				"scale=2",
+			},
+			notContains: []string{
+				"height=1000",
+			},
+		},
+		{
+			name:    "Explore requires datasourceUid",
+			baseURL: "http://localhost:3000",
+			args: GetPanelImageParams{
+				Explore: &RenderExplore{},
+			},
+			expectError: true,
+		},
+		{
+			name:    "Explore rejects panelId",
+			baseURL: "http://localhost:3000",
+			args: GetPanelImageParams{
+				Explore: &RenderExplore{DatasourceUID: "prom-uid"},
+				PanelID: intPtr(1),
+			},
+			expectError: true,
+		},
+		{
+			name:    "Explore and dashboardUid are mutually exclusive",
+			baseURL: "http://localhost:3000",
+			args: GetPanelImageParams{
+				DashboardUID: "abc123",
+				Explore:      &RenderExplore{DatasourceUID: "prom-uid"},
+			},
+			expectError: true,
 		},
 		{
 			name:    "Panel render with custom dimensions uses d-solo path",
@@ -205,6 +281,63 @@ func TestBuildRenderURL(t *testing.T) {
 			contains: []string{
 				"from=now-1h",
 				"to=now",
+			},
+		},
+		{
+			name:    "RFC3339 time range is sent as epoch millis",
+			baseURL: "http://localhost:3000",
+			args: GetPanelImageParams{
+				DashboardUID: "abc123",
+				PanelID:      intPtr(1),
+				TimeRange: &RenderTimeRange{
+					From: "2024-01-01T00:00:00Z",
+					To:   "2024-01-01T12:00:00Z",
+				},
+			},
+			contains: []string{
+				"from=1704067200000",
+				"to=1704110400000",
+			},
+			notContains: []string{"2024-01-01T"},
+		},
+		{
+			name:    "Date-only to resolves to end of day",
+			baseURL: "http://localhost:3000",
+			args: GetPanelImageParams{
+				DashboardUID: "abc123",
+				TimeRange:    &RenderTimeRange{From: "2024-01-01", To: "2024-01-01"},
+			},
+			contains: []string{
+				"from=1704067200000",
+				"to=1704153599999",
+			},
+		},
+		{
+			name:    "Relative and epoch times pass through",
+			baseURL: "http://localhost:3000",
+			args: GetPanelImageParams{
+				DashboardUID: "abc123",
+				TimeRange:    &RenderTimeRange{From: "now-6h", To: "1704110400000"},
+			},
+			contains: []string{
+				"from=now-6h",
+				"to=1704110400000",
+			},
+		},
+		{
+			name:    "Provisioning preview converts RFC3339 time range",
+			baseURL: "http://localhost:3000",
+			args: GetPanelImageParams{
+				ProvisioningPreview: &ProvisioningPreview{Repo: "repo", Path: "dash.json"},
+				TimeRange: &RenderTimeRange{
+					From: "2024-01-01T00:00:00Z",
+					To:   "2024-01-01T12:00:00Z",
+				},
+			},
+			contains: []string{
+				"/render/dashboard/provisioning/repo/preview/dash.json",
+				"from=1704067200000",
+				"to=1704110400000",
 			},
 		},
 		{
@@ -256,6 +389,18 @@ func TestBuildRenderURL(t *testing.T) {
 			},
 			contains: []string{
 				"scale=2",
+			},
+		},
+		{
+			name:    "With org ID",
+			baseURL: "http://localhost:3000",
+			orgID:   2,
+			args: GetPanelImageParams{
+				DashboardUID: "abc123",
+				PanelID:      intPtr(5),
+			},
+			contains: []string{
+				"targetOrgId=2",
 			},
 		},
 		{
@@ -456,11 +601,37 @@ func TestBuildRenderURL(t *testing.T) {
 			},
 			expectError: true,
 		},
+		{
+			// targetOrgId (not orgId): orgId would make the renderer's frontend
+			// persist an org switch via /api/user/using; targetOrgId scopes the
+			// org to this single render.
+			name:    "targetOrgId is added to the render URL when set",
+			baseURL: "http://localhost:3000",
+			orgID:   2,
+			args: GetPanelImageParams{
+				DashboardUID: "abc123",
+			},
+			contains: []string{
+				"http://localhost:3000/render/d/abc123",
+				"targetOrgId=2",
+			},
+		},
+		{
+			name:    "no org param when unset (default org)",
+			baseURL: "http://localhost:3000",
+			args: GetPanelImageParams{
+				DashboardUID: "abc123",
+			},
+			notContains: []string{
+				"targetOrgId",
+				"orgId",
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := buildRenderURL(tt.baseURL, tt.args)
+			result, err := buildRenderURL(tt.baseURL, tt.orgID, tt.args)
 			if tt.expectError {
 				require.Error(t, err)
 				return
@@ -475,6 +646,169 @@ func TestBuildRenderURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildRenderURLDimensions(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		args                 GetPanelImageParams
+		width, height, scale string
+	}{
+		{"panel defaults", GetPanelImageParams{DashboardUID: "abc", PanelID: intPtr(1)}, "1000", "750", "1"},
+		{"dashboard defaults", GetPanelImageParams{DashboardUID: "abc"}, "1200", "900", "1"},
+		{"preview panel", GetPanelImageParams{ProvisioningPreview: &ProvisioningPreview{Repo: "repo", Path: "d.json"}, PanelID: intPtr(1)}, "1000", "750", "1"},
+		{"preview dashboard", GetPanelImageParams{ProvisioningPreview: &ProvisioningPreview{Repo: "repo", Path: "d.json"}}, "1200", "900", "1"},
+		{"explore", GetPanelImageParams{Explore: &RenderExplore{DatasourceUID: "prom"}}, "1000", "1000", "1"},
+		{"width only", GetPanelImageParams{DashboardUID: "abc", PanelID: intPtr(1), Width: intPtr(800)}, "800", "750", "1"},
+		{"height only", GetPanelImageParams{DashboardUID: "abc", Height: intPtr(600)}, "1200", "600", "1"},
+		{"scale only", GetPanelImageParams{DashboardUID: "abc", Scale: intPtr(2)}, "1200", "900", "2"},
+		{"scale caps default width", GetPanelImageParams{DashboardUID: "abc", Scale: intPtr(3)}, "1000", "900", "3"},
+		{"all overrides", GetPanelImageParams{DashboardUID: "abc", Width: intPtr(1400), Height: intPtr(600), Scale: intPtr(2)}, "1400", "600", "2"},
+		{"full page", GetPanelImageParams{DashboardUID: "abc", Height: intPtr(-1), Scale: intPtr(3)}, "1000", "-1", "3"},
+		{"large dimensions", GetPanelImageParams{DashboardUID: "abc", Width: intPtr(100000), Height: intPtr(100000)}, "3000", "3000", "1"},
+		{"large scaled dimensions", GetPanelImageParams{DashboardUID: "abc", Width: intPtr(3000), Height: intPtr(3000), Scale: intPtr(2)}, "1500", "1500", "2"},
+		{"scale below minimum", GetPanelImageParams{DashboardUID: "abc", Scale: intPtr(0)}, "1200", "900", "1"},
+		{"negative scale", GetPanelImageParams{DashboardUID: "abc", Scale: intPtr(-5)}, "1200", "900", "1"},
+		{"scale above maximum", GetPanelImageParams{DashboardUID: "abc", Scale: intPtr(5)}, "1000", "900", "3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			u, err := buildRenderURL("http://localhost:3000", 0, tc.args)
+			require.NoError(t, err)
+			parsed, err := url.Parse(u)
+			require.NoError(t, err)
+			assert.Equal(t, tc.width, parsed.Query().Get("width"))
+			assert.Equal(t, tc.height, parsed.Query().Get("height"))
+			assert.Equal(t, tc.scale, parsed.Query().Get("scale"))
+		})
+	}
+	for _, args := range []GetPanelImageParams{
+		{DashboardUID: "abc", Width: intPtr(0)},
+		{DashboardUID: "abc", Width: intPtr(-1)},
+		{DashboardUID: "abc", Height: intPtr(0)},
+		{DashboardUID: "abc", Height: intPtr(-2)},
+	} {
+		_, err := buildRenderURL("http://localhost:3000", 0, args)
+		require.Error(t, err)
+	}
+}
+
+func TestGetPanelImageResponseLimit(t *testing.T) {
+	// The render limit is the fork's renderResponseLimitBytes (25 MiB), not
+	// the generic defaultResponseLimitBytes.
+	for _, size := range []int{renderResponseLimitBytes - 1, renderResponseLimitBytes, renderResponseLimitBytes + 1} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, strings.Repeat("x", size))
+			}))
+			defer server.Close()
+			ctx := mcpgrafana.WithGrafanaConfig(t.Context(), mcpgrafana.GrafanaConfig{URL: server.URL})
+			result, err := getPanelImage(ctx, GetPanelImageParams{DashboardUID: "abc"})
+			if size > renderResponseLimitBytes {
+				require.ErrorContains(t, err, "exceeds maximum size")
+				require.ErrorIs(t, err, errResponseBodyTooLarge)
+				require.ErrorContains(t, err, "try a smaller width, height or scale")
+				require.NotContains(t, err.Error(), "narrowing your query")
+				require.Nil(t, result)
+			} else {
+				require.NoError(t, err)
+				require.Len(t, result.Content[0].(*mcp.ImageContent).Data, size)
+			}
+		})
+	}
+}
+
+// The deeplink carries no org, so it is only emitted when it would open in the
+// org the image was rendered from. `?orgId=N` would persist an org switch onto
+// the viewer's user record via Grafana's OrgRedirect middleware, so a link that
+// cannot be shown to resolve correctly is dropped instead.
+func TestRenderLimits(t *testing.T) {
+	t.Run("timeout", func(t *testing.T) {
+		assert.Equal(t, 60*time.Second, renderTimeout(GetPanelImageParams{}))
+		assert.Equal(t, 60*time.Second, renderTimeout(GetPanelImageParams{Timeout: intPtr(0)}))
+		assert.Equal(t, 30*time.Second, renderTimeout(GetPanelImageParams{Timeout: intPtr(30)}))
+		assert.Equal(t, 120*time.Second, renderTimeout(GetPanelImageParams{Timeout: intPtr(1 << 62)}))
+	})
+
+	t.Run("dimensions", func(t *testing.T) {
+		u, err := buildRenderURL("http://localhost:3000", 0, GetPanelImageParams{
+			DashboardUID: "abc123",
+			Width:        intPtr(100000),
+			Height:       intPtr(100000),
+		})
+		require.NoError(t, err)
+		assert.Contains(t, u, "width=3000")
+		assert.Contains(t, u, "height=3000")
+
+		// height=-1 (full page) is passed through unchanged.
+		u, err = buildRenderURL("http://localhost:3000", 0, GetPanelImageParams{
+			DashboardUID: "abc123",
+			Height:       intPtr(-1),
+		})
+		require.NoError(t, err)
+		assert.Contains(t, u, "height=-1")
+	})
+}
+
+func TestDeeplinkResolvesInRenderOrg(t *testing.T) {
+	// userOrg serves /api/user reporting the identity's stored org. That value is
+	// deliberately not request-scoped in Grafana, so it is what a browser session
+	// would land in regardless of GRAFANA_ORG_ID or X-Grafana-Org-Id.
+	userOrg := func(t *testing.T, orgID int64, status int) context.Context {
+		t.Helper()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/api/user" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if status != http.StatusOK {
+				w.WriteHeader(status)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"orgId":%d}`, orgID)
+		}))
+		t.Cleanup(ts.Close)
+		return mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{URL: ts.URL})
+	}
+
+	t.Run("no org selected: link agrees without a lookup", func(t *testing.T) {
+		// No server at all, proving the zero case short-circuits.
+		ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{URL: "http://127.0.0.1:1"})
+		assert.True(t, deeplinkResolvesInRenderOrg(ctx, 0))
+	})
+
+	t.Run("render org matches the viewer's org", func(t *testing.T) {
+		assert.True(t, deeplinkResolvesInRenderOrg(userOrg(t, 2, http.StatusOK), 2))
+	})
+
+	t.Run("render org differs from the viewer's org", func(t *testing.T) {
+		assert.False(t, deeplinkResolvesInRenderOrg(userOrg(t, 1, http.StatusOK), 2))
+	})
+
+	t.Run("lookup failure omits the link", func(t *testing.T) {
+		assert.False(t, deeplinkResolvesInRenderOrg(userOrg(t, 0, http.StatusForbidden), 2))
+	})
+
+	t.Run("negative org is treated as unset, like the render path", func(t *testing.T) {
+		// OrgIDRoundTripper and buildRenderURL both require > 0, so nothing was
+		// sent to the renderer and the identity's own org was used.
+		ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{URL: "http://127.0.0.1:1"})
+		assert.True(t, deeplinkResolvesInRenderOrg(ctx, -5))
+	})
+}
+
+// The deeplink must never carry orgId, whatever else it encodes.
+func TestBuildDashboardDeeplinkOmitsOrg(t *testing.T) {
+	panelID := 7
+	got, err := buildDashboardDeeplink("http://localhost:3000", GetPanelImageParams{
+		DashboardUID: "abc123",
+		PanelID:      &panelID,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, got, "/d/abc123")
+	assert.Contains(t, got, "viewPanel=7")
+	assert.NotContains(t, got, "orgId")
+	assert.NotContains(t, got, "targetOrgId")
 }
 
 func TestGetPanelImage(t *testing.T) {
@@ -494,8 +828,9 @@ func TestGetPanelImage(t *testing.T) {
 	t.Run("Successful image render", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			assert.Contains(t, r.URL.Path, "/render/d/test-dash")
-			assert.Equal(t, "1000", r.URL.Query().Get("width"))
-			assert.Equal(t, "500", r.URL.Query().Get("height"))
+			assert.Equal(t, "1200", r.URL.Query().Get("width"))
+			assert.Equal(t, "900", r.URL.Query().Get("height"))
+			assert.Equal(t, "1", r.URL.Query().Get("scale"))
 
 			w.Header().Set("Content-Type", "image/png")
 			w.WriteHeader(http.StatusOK)
@@ -515,21 +850,21 @@ func TestGetPanelImage(t *testing.T) {
 
 		require.NoError(t, err)
 		require.NotNil(t, result)
-		require.Len(t, result.Content, 1)
+		require.Len(t, result.Content, 2)
 
-		// Check that the content is image content with base64 data
-		content := result.Content[0]
-		imageContent, ok := content.(interface {
-			GetData() string
-			GetMimeType() string
-		})
-		if ok {
-			assert.Equal(t, "image/png", imageContent.GetMimeType())
-			// Verify base64 decoding works
-			decoded, err := base64.StdEncoding.DecodeString(imageContent.GetData())
-			require.NoError(t, err)
-			assert.Equal(t, testPNGData, decoded)
-		}
+		// Check image content
+		imageContent, ok := result.Content[0].(*mcp.ImageContent)
+		require.True(t, ok, "first content item should be ImageContent")
+		assert.Equal(t, "image/png", imageContent.MIMEType)
+		decoded := imageContent.Data
+		assert.Equal(t, testPNGData, decoded)
+
+		// Check deeplink content
+		textContent, ok := result.Content[1].(*mcp.TextContent)
+		require.True(t, ok, "second content item should be TextContent")
+		assert.Equal(t, server.URL+"/d/test-dash", textContent.Text)
+		assertDeeplinkMeta(t, textContent)
+		assert.Equal(t, map[string]any{"deeplink": server.URL + "/d/test-dash"}, result.StructuredContent)
 	})
 
 	t.Run("Panel image with specific panel ID uses d-solo path and panelId param", func(t *testing.T) {
@@ -557,6 +892,194 @@ func TestGetPanelImage(t *testing.T) {
 
 		require.NoError(t, err)
 		require.NotNil(t, result)
+		require.Len(t, result.Content, 2)
+
+		textContent, ok := result.Content[1].(*mcp.TextContent)
+		require.True(t, ok)
+		assert.Equal(t, server.URL+"/d/test-dash?viewPanel=5", textContent.Text)
+		assertDeeplinkMeta(t, textContent)
+	})
+
+	t.Run("Provisioning preview deeplink uses /dashboard/provisioning route", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "image/png")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(testPNGData)
+		}))
+		defer server.Close()
+
+		grafanaCfg := mcpgrafana.GrafanaConfig{URL: server.URL, APIKey: "test-api-key"}
+		ctx := mcpgrafana.WithGrafanaConfig(context.Background(), grafanaCfg)
+
+		t.Run("full dashboard, no ref", func(t *testing.T) {
+			result, err := getPanelImage(ctx, GetPanelImageParams{
+				ProvisioningPreview: &ProvisioningPreview{
+					Repo: "my-repo",
+					Path: "folder/dashboard.json",
+				},
+			})
+			require.NoError(t, err)
+			require.Len(t, result.Content, 2)
+
+			text, ok := result.Content[1].(*mcp.TextContent)
+			require.True(t, ok)
+			assert.Equal(t,
+				server.URL+"/dashboard/provisioning/my-repo/preview/folder/dashboard.json",
+				text.Text,
+			)
+			assertDeeplinkMeta(t, text)
+		})
+
+		t.Run("specific panel with ref", func(t *testing.T) {
+			panelID := 7
+			result, err := getPanelImage(ctx, GetPanelImageParams{
+				ProvisioningPreview: &ProvisioningPreview{
+					Repo: "my-repo",
+					Path: "dashboard.json",
+					Ref:  "feature/branch",
+				},
+				PanelID: &panelID,
+			})
+			require.NoError(t, err)
+			require.Len(t, result.Content, 2)
+
+			text, ok := result.Content[1].(*mcp.TextContent)
+			require.True(t, ok)
+			parsed, err := url.Parse(text.Text)
+			require.NoError(t, err)
+			assert.Equal(t,
+				"/dashboard/provisioning/my-repo/preview/dashboard.json",
+				parsed.Path,
+			)
+			assert.Equal(t, "feature/branch", parsed.Query().Get("ref"))
+			assert.Equal(t, "7", parsed.Query().Get("viewPanel"))
+			assertDeeplinkMeta(t, text)
+		})
+	})
+
+	t.Run("Deeplink prefers public Grafana URL over config URL", func(t *testing.T) {
+		// httptest server stands in for the internal endpoint; PublicURL is
+		// what the user's browser reaches.
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "image/png")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(testPNGData)
+		}))
+		defer server.Close()
+
+		const publicURL = "https://grafana.example.com"
+
+		grafanaCfg := mcpgrafana.GrafanaConfig{URL: server.URL, APIKey: "test-api-key"}
+		ctx := mcpgrafana.WithGrafanaConfig(context.Background(), grafanaCfg)
+		ctx = mcpgrafana.WithGrafanaClient(ctx, &mcpgrafana.GrafanaClient{PublicURL: publicURL})
+
+		result, err := getPanelImage(ctx, GetPanelImageParams{DashboardUID: "test-dash"})
+		require.NoError(t, err)
+		require.Len(t, result.Content, 2)
+
+		text, ok := result.Content[1].(*mcp.TextContent)
+		require.True(t, ok)
+		assert.Equal(t, publicURL+"/d/test-dash", text.Text)
+		assertDeeplinkMeta(t, text)
+	})
+
+	t.Run("Deeplink mirrors render time range", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "image/png")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(testPNGData)
+		}))
+		defer server.Close()
+
+		grafanaCfg := mcpgrafana.GrafanaConfig{URL: server.URL, APIKey: "test-api-key"}
+		ctx := mcpgrafana.WithGrafanaConfig(context.Background(), grafanaCfg)
+
+		result, err := getPanelImage(ctx, GetPanelImageParams{
+			DashboardUID: "test-dash",
+			TimeRange: &RenderTimeRange{
+				From: "now-6h",
+				To:   "now",
+			},
+		})
+		require.NoError(t, err)
+		require.Len(t, result.Content, 2)
+
+		text, ok := result.Content[1].(*mcp.TextContent)
+		require.True(t, ok)
+		parsed, err := url.Parse(text.Text)
+		require.NoError(t, err)
+		assert.Equal(t, "/d/test-dash", parsed.Path)
+		assert.Equal(t, "now-6h", parsed.Query().Get("from"))
+		assert.Equal(t, "now", parsed.Query().Get("to"))
+	})
+
+	t.Run("Deeplink converts RFC3339 time range to epoch ms", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "image/png")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(testPNGData)
+		}))
+		defer server.Close()
+
+		grafanaCfg := mcpgrafana.GrafanaConfig{URL: server.URL, APIKey: "test-api-key"}
+		ctx := mcpgrafana.WithGrafanaConfig(context.Background(), grafanaCfg)
+
+		const fromRFC = "2026-04-28T12:45:00Z"
+		const toRFC = "2026-04-28T13:00:00Z"
+		fromTime, err := time.Parse(time.RFC3339, fromRFC)
+		require.NoError(t, err)
+		toTime, err := time.Parse(time.RFC3339, toRFC)
+		require.NoError(t, err)
+
+		result, err := getPanelImage(ctx, GetPanelImageParams{
+			DashboardUID: "test-dash",
+			TimeRange: &RenderTimeRange{
+				From: fromRFC,
+				To:   toRFC,
+			},
+		})
+		require.NoError(t, err)
+		require.Len(t, result.Content, 2)
+
+		text, ok := result.Content[1].(*mcp.TextContent)
+		require.True(t, ok)
+		parsed, err := url.Parse(text.Text)
+		require.NoError(t, err)
+		assert.Equal(t, strconv.FormatInt(fromTime.UnixMilli(), 10), parsed.Query().Get("from"))
+		assert.Equal(t, strconv.FormatInt(toTime.UnixMilli(), 10), parsed.Query().Get("to"))
+	})
+
+	t.Run("Deeplink mirrors dashboard variables", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "image/png")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(testPNGData)
+		}))
+		defer server.Close()
+
+		grafanaCfg := mcpgrafana.GrafanaConfig{URL: server.URL, APIKey: "test-api-key"}
+		ctx := mcpgrafana.WithGrafanaConfig(context.Background(), grafanaCfg)
+
+		result, err := getPanelImage(ctx, GetPanelImageParams{
+			DashboardUID: "test-dash",
+			Variables: map[string]StringOrSlice{
+				"var-env":      {"prod"},
+				"var-instance": {"172.16.31.129", "172.16.32.99"},
+			},
+		})
+		require.NoError(t, err)
+		require.Len(t, result.Content, 2)
+
+		text, ok := result.Content[1].(*mcp.TextContent)
+		require.True(t, ok)
+		parsed, err := url.Parse(text.Text)
+		require.NoError(t, err)
+		assert.Equal(t, "/d/test-dash", parsed.Path)
+		assert.Equal(t, "prod", parsed.Query().Get("var-env"))
+		assert.ElementsMatch(t,
+			[]string{"172.16.31.129", "172.16.32.99"},
+			parsed.Query()["var-instance"],
+		)
 	})
 
 	t.Run("Authentication header with API key", func(t *testing.T) {
@@ -796,655 +1319,79 @@ func TestGetPanelImage(t *testing.T) {
 	})
 }
 
-// newImageServer returns a fake Grafana /render endpoint that always serves
-// testPNGData. The shared helper keeps the output-format tests focused on the
-// content packaging rather than on repeating HTTP plumbing.
-func newImageServer(t *testing.T, testPNGData []byte, contentType string) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if contentType != "" {
-			w.Header().Set("Content-Type", contentType)
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(testPNGData)
-	}))
-}
-
-func TestResolveOutputFormat(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   *string
-		want    string
-		wantErr bool
-	}{
-		{name: "nil -> default", input: nil, want: outputFormatImage},
-		{name: "image literal", input: stringPtr("image"), want: outputFormatImage},
-		{name: "resource literal", input: stringPtr("resource"), want: outputFormatResource},
-		{name: "both literal", input: stringPtr("both"), want: outputFormatBoth},
-		{name: "text_base64 literal", input: stringPtr("text_base64"), want: outputFormatTextBase64},
-		// Schema advertises lowercase only; we reject deviations so a
-		// client that validates against the enum sees the same behavior
-		// as the server. Explicit "" is a caller bug, not a "don't care"
-		// signal — the pointer being nil is the only valid "don't care".
-		{name: "empty string rejected", input: stringPtr(""), wantErr: true},
-		{name: "uppercase rejected", input: stringPtr("BOTH"), wantErr: true},
-		{name: "whitespace rejected", input: stringPtr(" both "), wantErr: true},
-		{name: "unknown value errors", input: stringPtr("binary"), wantErr: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := resolveOutputFormat(tt.input)
-			if tt.wantErr {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), "invalid outputFormat")
-				return
+// The org reaches this tool through GrafanaConfig, set by OrgIDOverrideMiddleware
+// from a per-call orgId or carried from the connection. The render must be scoped
+// to it, and the deeplink withheld when it is not where the viewer would land.
+func TestGetPanelImageOrgIDOmitDeeplink(t *testing.T) {
+	testPNGData := []byte("test PNG")
+	grafanaCfg := mcpgrafana.GrafanaConfig{
+		URL:    "http://grafana.test",
+		APIKey: "test-api-key",
+		OrgID:  2,
+		BaseTransport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			// /api/user is the deeplink gate's viewer-org lookup; report org 1 so
+			// it differs from the render org and the link is withheld.
+			if req.URL.Path == "/api/user" {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"orgId":1}`)),
+					Request:    req,
+				}, nil
 			}
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, got)
-		})
+
+			assert.Equal(t, "2", req.Header.Get("X-Grafana-Org-Id"))
+			assert.Equal(t, "2", req.URL.Query().Get("targetOrgId"))
+			assert.Empty(t, req.URL.Query().Get("orgId"))
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewReader(testPNGData)),
+				Request:    req,
+			}, nil
+		}),
 	}
-}
-
-func TestBuildRenderResourceURI(t *testing.T) {
-	// Pinned so the test fails loudly if the hashing scheme ever changes
-	// accidentally. Computed as hex.EncodeToString(sha256("payload")[:16]).
-	const payload = "payload"
-	const wantHash = "239f59ed55e737c77147cf55ad0c1b03"
-
-	tests := []struct {
-		name string
-		args GetPanelImageParams
-		want string
-	}{
-		{
-			name: "dashboard only",
-			args: GetPanelImageParams{DashboardUID: "abc123"},
-			want: "grafana://render/dashboard/abc123?h=" + wantHash,
-		},
-		{
-			name: "panel included",
-			args: GetPanelImageParams{DashboardUID: "abc123", PanelID: intPtr(7)},
-			want: "grafana://render/dashboard/abc123/panel/7?h=" + wantHash,
-		},
-		{
-			name: "uid with special chars is escaped",
-			args: GetPanelImageParams{DashboardUID: "has/slash and space"},
-			want: "grafana://render/dashboard/has%2Fslash%20and%20space?h=" + wantHash,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, buildRenderResourceURI(tt.args, []byte(payload)))
-		})
-	}
-}
-
-// TestBuildRenderResourceURI_DistinctContentYieldsDistinctURI locks in the
-// dedup-disambiguation contract: two renders of the same dashboard with
-// different pixel bytes must produce different URIs so MCP clients that
-// dedupe by URI don't collapse them into one.
-func TestBuildRenderResourceURI_DistinctContentYieldsDistinctURI(t *testing.T) {
-	args := GetPanelImageParams{DashboardUID: "abc"}
-	uri1 := buildRenderResourceURI(args, []byte("render-1"))
-	uri2 := buildRenderResourceURI(args, []byte("render-2"))
-	assert.NotEqual(t, uri1, uri2, "distinct image bytes must yield distinct URIs")
-}
-
-// TestBuildRenderResourceURI_StableForSameContent locks in the
-// idempotency contract: re-rendering the identical state produces the
-// identical URI, letting well-behaved caches treat it as a cache key.
-func TestBuildRenderResourceURI_StableForSameContent(t *testing.T) {
-	args := GetPanelImageParams{DashboardUID: "abc", PanelID: intPtr(3)}
-	uri1 := buildRenderResourceURI(args, []byte("render-1"))
-	uri2 := buildRenderResourceURI(args, []byte("render-1"))
-	assert.Equal(t, uri1, uri2, "identical image bytes must yield identical URIs")
-}
-
-// TestGetPanelImage_OutputFormats exercises the full HTTP path for each
-// supported outputFormat, proving that the wire-level Content slice matches
-// what downstream hooks rely on (ImageContent for display, BlobResourceContents
-// for reliable decode out-of-band).
-func TestGetPanelImage_OutputFormats(t *testing.T) {
-	testPNGData := []byte{
-		0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-		0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-		0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
-		0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,
-		0x54, 0x08, 0xD7, 0x63, 0xF8, 0xFF, 0xFF, 0x3F,
-		0x00, 0x05, 0xFE, 0x02, 0xFE, 0xDC, 0xCC, 0x59,
-		0xE7, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
-		0x44, 0xAE, 0x42, 0x60, 0x82,
-	}
-	wantB64 := base64.StdEncoding.EncodeToString(testPNGData)
-
-	type assertion func(t *testing.T, result *mcp.CallToolResult)
-
-	assertImageOnly := func(t *testing.T, result *mcp.CallToolResult) {
-		t.Helper()
-		require.Len(t, result.Content, 1)
-		img, ok := result.Content[0].(mcp.ImageContent)
-		require.True(t, ok, "first content must be ImageContent, got %T", result.Content[0])
-		assert.Equal(t, "image", img.Type)
-		assert.Equal(t, "image/png", img.MIMEType)
-		assert.Equal(t, wantB64, img.Data)
-	}
-
-	assertResourceOnly := func(t *testing.T, result *mcp.CallToolResult) {
-		t.Helper()
-		require.Len(t, result.Content, 1)
-		res, ok := result.Content[0].(mcp.EmbeddedResource)
-		require.True(t, ok, "first content must be EmbeddedResource, got %T", result.Content[0])
-		assert.Equal(t, "resource", res.Type)
-		blob, ok := res.Resource.(mcp.BlobResourceContents)
-		require.True(t, ok, "resource payload must be BlobResourceContents, got %T", res.Resource)
-		assert.Equal(t, "image/png", blob.MIMEType)
-		assert.Equal(t, wantB64, blob.Blob)
-		assert.True(t, strings.HasPrefix(blob.URI, "grafana://render/dashboard/test-dash?h="),
-			"resource URI must be dashboard-scoped with a content hash, got %q", blob.URI)
-		// The resource block should be annotated so context-pruning clients
-		// know it's out-of-band tooling payload, not something to feed the LLM.
-		require.NotNil(t, res.Annotations)
-		assert.Equal(t, []mcp.Role{mcp.RoleUser}, res.Annotations.Audience)
-	}
-
-	assertBoth := func(t *testing.T, result *mcp.CallToolResult) {
-		t.Helper()
-		require.Len(t, result.Content, 2, "'both' must emit ImageContent first, EmbeddedResource second")
-		img, ok := result.Content[0].(mcp.ImageContent)
-		require.True(t, ok, "first content must be ImageContent, got %T", result.Content[0])
-		assert.Equal(t, wantB64, img.Data)
-		res, ok := result.Content[1].(mcp.EmbeddedResource)
-		require.True(t, ok, "second content must be EmbeddedResource, got %T", result.Content[1])
-		blob, ok := res.Resource.(mcp.BlobResourceContents)
-		require.True(t, ok)
-		assert.Equal(t, wantB64, blob.Blob)
-	}
-
-	assertTextBase64 := func(t *testing.T, result *mcp.CallToolResult) {
-		t.Helper()
-		require.Len(t, result.Content, 1, "text_base64 must emit exactly one TextContent block")
-		txt, ok := result.Content[0].(mcp.TextContent)
-		require.True(t, ok, "content must be TextContent, got %T", result.Content[0])
-		assert.Equal(t, "text", txt.Type)
-		// Must be ONLY the base64 — no prefix, suffix, or wrapper. Any
-		// stray characters would corrupt a downstream `base64 -d` pipe.
-		assert.Equal(t, wantB64, txt.Text)
-		// No line wrapping either — the shell pipe uses single-line input.
-		assert.NotContains(t, txt.Text, "\n", "base64 must be single-line for shell pipe")
-		assert.NotContains(t, txt.Text, "\r", "base64 must be single-line for shell pipe")
-		// Annotations deliberately left nil: MCP annotations are hints,
-		// and a client that interprets audience=[assistant] as "drop
-		// from context" would silently defeat the whole point of this
-		// mode. Pin the default-audience contract so a future maintainer
-		// doesn't "fix" the asymmetry by copy-pasting the image/resource
-		// annotations onto this branch.
-		assert.Nil(t, txt.Annotations, "TextContent must use default audience so the model reliably sees the base64")
-	}
-
-	cases := []struct {
-		name   string
-		format *string
-		check  assertion
-	}{
-		{name: "default (nil) → image", format: nil, check: assertImageOnly},
-		{name: "explicit image", format: stringPtr("image"), check: assertImageOnly},
-		{name: "resource only", format: stringPtr("resource"), check: assertResourceOnly},
-		{name: "both", format: stringPtr("both"), check: assertBoth},
-		{name: "text_base64", format: stringPtr("text_base64"), check: assertTextBase64},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			server := newImageServer(t, testPNGData, "image/png")
-			defer server.Close()
-
-			ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
-				URL:    server.URL,
-				APIKey: "test-api-key",
-			})
-
-			result, err := getPanelImage(ctx, GetPanelImageParams{
-				DashboardUID: "test-dash",
-				OutputFormat: tc.format,
-			})
-			require.NoError(t, err)
-			require.NotNil(t, result)
-			tc.check(t, result)
-		})
-	}
-}
-
-// TestGetPanelImage_InvalidOutputFormat checks that we fail loudly on typos
-// rather than silently falling back to the default — matters because the tool
-// description advertises enum-style values and callers rely on us rejecting
-// anything else.
-func TestGetPanelImage_InvalidOutputFormat(t *testing.T) {
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
-		URL:    "http://example.invalid",
-		APIKey: "test-api-key",
-	})
-
-	_, err := getPanelImage(ctx, GetPanelImageParams{
-		DashboardUID: "test-dash",
-		OutputFormat: stringPtr("pdf"),
-	})
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid outputFormat")
-	assert.Contains(t, err.Error(), `"pdf"`)
-	assert.Contains(t, err.Error(), "image")
-	assert.Contains(t, err.Error(), "resource")
-	assert.Contains(t, err.Error(), "both")
-	assert.Contains(t, err.Error(), "text_base64")
-}
-
-// TestGetPanelImage_TextBase64_DecodesToOriginalBytes locks in the contract
-// that callers rely on when they pipe the returned text through `base64 -d`:
-// the TextContent.Text field must be exactly the base64 encoding of the
-// image bytes, with no prose, prefix, or trailing whitespace that would
-// make the decoded output garbage.
-func TestGetPanelImage_TextBase64_DecodesToOriginalBytes(t *testing.T) {
-	testPNGData := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xde, 0xad, 0xbe, 0xef}
-	server := newImageServer(t, testPNGData, "image/png")
-	defer server.Close()
-
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
-		URL:    server.URL,
-		APIKey: "test-api-key",
-	})
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), grafanaCfg)
 
 	result, err := getPanelImage(ctx, GetPanelImageParams{
 		DashboardUID: "test-dash",
-		OutputFormat: stringPtr("text_base64"),
 	})
+
 	require.NoError(t, err)
 	require.Len(t, result.Content, 1)
-
-	txt := result.Content[0].(mcp.TextContent)
-	decoded, err := base64.StdEncoding.DecodeString(txt.Text)
-	require.NoError(t, err, "TextContent.Text must be plain base64 with no wrapper")
+	image, ok := result.Content[0].(*mcp.ImageContent)
+	require.True(t, ok, "only content item should be ImageContent")
+	decoded := image.Data
 	assert.Equal(t, testPNGData, decoded)
 }
 
-// TestGetPanelImage_TextBase64_RejectsNonPNG verifies that text_base64 refuses
-// to silently hand the model bytes for a non-PNG content type. The mode is
-// documented as returning PNG bytes; a caller decoding with `base64 -d >
-// render.png` would otherwise save a JPEG under a .png filename.
-func TestGetPanelImage_TextBase64_RejectsNonPNG(t *testing.T) {
-	testJPEGData := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46}
-	server := newImageServer(t, testJPEGData, "image/jpeg")
-	defer server.Close()
+func TestGetPanelImageToolMeta(t *testing.T) {
+	tool := GetPanelImage.Tool
+	require.NotNil(t, tool.Meta, "get_panel_image should have _meta for MCP Apps")
+	require.NotNil(t, tool.Meta)
 
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
-		URL:    server.URL,
-		APIKey: "test-api-key",
-	})
-
-	_, err := getPanelImage(ctx, GetPanelImageParams{
-		DashboardUID: "test-dash",
-		OutputFormat: stringPtr("text_base64"),
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "image/png")
-	assert.Contains(t, err.Error(), "image/jpeg")
+	ui, ok := tool.Meta["ui"].(map[string]any)
+	require.True(t, ok, "expected _meta.ui to be a map")
+	assert.Equal(t, mcpgrafana.PanelViewerResourceURI, ui["resourceUri"])
 }
 
-// TestGetPanelImage_TextBase64_RejectsOversizedPayload verifies that the mode
-// refuses payloads large enough to blow past the model's output token window
-// on the return trip. Silent truncation there would corrupt the written file
-// with no error signal, which is worse than a clean server-side error.
-func TestGetPanelImage_TextBase64_RejectsOversizedPayload(t *testing.T) {
-	const chunkSize = 64 * 1024
-	chunk := bytes.Repeat([]byte{0x89}, chunkSize)
-
-	// Serve textBase64MaxImageBytes+1 bytes starting with PNG magic, so
-	// the size guard (not the magic-byte guard) is what trips.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "image/png")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A})
-		remaining := textBase64MaxImageBytes + 1 - 8
-		for remaining > 0 {
-			n := chunkSize
-			if remaining < n {
-				n = remaining
-			}
-			if _, err := w.Write(chunk[:n]); err != nil {
-				return
-			}
-			remaining -= n
-		}
-	}))
-	defer server.Close()
-
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
-		URL:    server.URL,
-		APIKey: "test-api-key",
-	})
-
-	_, err := getPanelImage(ctx, GetPanelImageParams{
-		DashboardUID: "test-dash",
-		OutputFormat: stringPtr("text_base64"),
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "text_base64")
-	assert.Contains(t, err.Error(), "exceeds")
+// assertDeeplinkMeta checks the `_meta.ui.kind = "deeplink"` marker the
+// panel viewer uses to detect the deeplink content item.
+func assertDeeplinkMeta(t *testing.T, c *mcp.TextContent) {
+	t.Helper()
+	require.NotNil(t, c.Meta)
+	ui, ok := c.Meta["ui"].(map[string]any)
+	require.True(t, ok, "expected _meta.ui to be a map, got %T", c.Meta["ui"])
+	assert.Equal(t, mcpgrafana.UIContentKindDeeplink, ui["kind"])
 }
 
-// TestGetPanelImage_TextBase64_RejectsNonPNGBody verifies the magic-byte
-// guard fires when upstream lies about the Content-Type. A server serving
-// HTML/error pages with a missing or wrong Content-Type would otherwise
-// pass the MIME check (parseImageMIME falls back to image/png) and reach
-// the model as "PNG bytes".
-func TestGetPanelImage_TextBase64_RejectsNonPNGBody(t *testing.T) {
-	htmlBody := []byte("<!DOCTYPE html><html><body>not a png</body></html>")
-	// Intentionally omit Content-Type so parseImageMIME's fallback kicks
-	// in; the magic-byte check must still catch this.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(htmlBody)
-	}))
-	defer server.Close()
-
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
-		URL:    server.URL,
-		APIKey: "test-api-key",
-	})
-
-	_, err := getPanelImage(ctx, GetPanelImageParams{
-		DashboardUID: "test-dash",
-		OutputFormat: stringPtr("text_base64"),
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not a PNG")
-}
-
-// TestHasPNGSignature covers the magic-byte helper directly, including the
-// nil/short-input edge cases where the byte slice is shorter than the
-// 8-byte signature.
-func TestHasPNGSignature(t *testing.T) {
-	tests := []struct {
-		name string
-		in   []byte
-		want bool
-	}{
-		{name: "valid PNG magic", in: []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 'I', 'H', 'D', 'R'}, want: true},
-		{name: "exactly 8 bytes of magic", in: []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, want: true},
-		{name: "wrong first byte", in: []byte{0x88, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, want: false},
-		{name: "HTML", in: []byte("<html>"), want: false},
-		{name: "JPEG magic", in: []byte{0xFF, 0xD8, 0xFF, 0xE0}, want: false},
-		{name: "too short", in: []byte{0x89, 'P', 'N', 'G'}, want: false},
-		{name: "empty", in: []byte{}, want: false},
-		{name: "nil", in: nil, want: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, hasPNGSignature(tt.in))
-		})
-	}
-}
-
-// TestGetPanelImage_TextBase64_AllowsPayloadAtLimit confirms the size guard
-// is "exceeds", not "at or exceeds" — exactly-at-limit renders must succeed.
-func TestGetPanelImage_TextBase64_AllowsPayloadAtLimit(t *testing.T) {
-	// Prefix with the real PNG magic so the bytes actually look like a
-	// PNG — otherwise the magic-byte guard (which runs alongside the
-	// size guard) would reject this first and hide a regression in the
-	// size check.
-	atLimit := make([]byte, textBase64MaxImageBytes)
-	copy(atLimit, []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A})
-	server := newImageServer(t, atLimit, "image/png")
-	defer server.Close()
-
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
-		URL:    server.URL,
-		APIKey: "test-api-key",
-	})
-
-	result, err := getPanelImage(ctx, GetPanelImageParams{
-		DashboardUID: "test-dash",
-		OutputFormat: stringPtr("text_base64"),
+func TestBuildDashboardDeeplinkExplore(t *testing.T) {
+	link, err := buildDashboardDeeplink("http://grafana.example/", GetPanelImageParams{
+		Explore:   &RenderExplore{DatasourceUID: "prom-uid"},
+		TimeRange: &RenderTimeRange{From: "now-1h", To: "now"},
 	})
 	require.NoError(t, err)
-	require.Len(t, result.Content, 1)
-	// Prove the at-limit render round-trips cleanly, not just that
-	// an error isn't returned — a regression that swapped TextContent
-	// for another shape, or corrupted the base64, would otherwise slip
-	// through the size-guard test.
-	txt, ok := result.Content[0].(mcp.TextContent)
-	require.True(t, ok, "content must be TextContent at size boundary, got %T", result.Content[0])
-	decoded, err := base64.StdEncoding.DecodeString(txt.Text)
-	require.NoError(t, err)
-	assert.Equal(t, atLimit, decoded)
-}
-
-// TestGetPanelImage_PanelURIIncludesPanelID ensures EmbeddedResource URIs for
-// panel-scoped renders carry the panel ID, so callers can distinguish them
-// from whole-dashboard renders in logs and caches.
-func TestGetPanelImage_PanelURIIncludesPanelID(t *testing.T) {
-	testPNGData := []byte{0x89, 0x50, 0x4E, 0x47}
-	server := newImageServer(t, testPNGData, "image/png")
-	defer server.Close()
-
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
-		URL:    server.URL,
-		APIKey: "test-api-key",
-	})
-
-	result, err := getPanelImage(ctx, GetPanelImageParams{
-		DashboardUID: "test-dash",
-		PanelID:      intPtr(42),
-		OutputFormat: stringPtr("resource"),
-	})
-	require.NoError(t, err)
-
-	res := result.Content[0].(mcp.EmbeddedResource)
-	blob := res.Resource.(mcp.BlobResourceContents)
-	assert.True(t, strings.HasPrefix(blob.URI, "grafana://render/dashboard/test-dash/panel/42?h="),
-		"panel-scoped URI must include dashboard UID, panel ID, and content hash, got %q", blob.URI)
-}
-
-// TestGetPanelImage_MIMETypeFromResponse verifies we trust the Content-Type
-// from Grafana when it is a valid image/* type, and fall back to image/png
-// otherwise. Prevents regressions where non-PNG renders (JPEG via a proxy)
-// would be mislabeled in the resource blob.
-func TestGetPanelImage_MIMETypeFromResponse(t *testing.T) {
-	tests := []struct {
-		name        string
-		contentType string
-		wantMIME    string
-	}{
-		{name: "png passthrough", contentType: "image/png", wantMIME: "image/png"},
-		{name: "jpeg passthrough", contentType: "image/jpeg", wantMIME: "image/jpeg"},
-		{name: "missing falls back to png", contentType: "", wantMIME: "image/png"},
-		{name: "non-image falls back to png", contentType: "application/json", wantMIME: "image/png"},
-		// Gateways like Kong/nginx frequently append parameters; the server
-		// must strip them so clients don't see a malformed MIME token.
-		{name: "png with charset param", contentType: "image/png; charset=utf-8", wantMIME: "image/png"},
-		{name: "png with multiple params", contentType: "image/png; charset=binary; boundary=x", wantMIME: "image/png"},
-		{name: "jpeg with spaces and caps", contentType: "IMAGE/JPEG; Quality=85", wantMIME: "image/jpeg"},
-		{name: "malformed header falls back", contentType: "image/;;", wantMIME: "image/png"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			testPNGData := []byte{0x89, 0x50, 0x4E, 0x47}
-			server := newImageServer(t, testPNGData, tt.contentType)
-			defer server.Close()
-
-			ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
-				URL:    server.URL,
-				APIKey: "test-api-key",
-			})
-
-			result, err := getPanelImage(ctx, GetPanelImageParams{
-				DashboardUID: "test-dash",
-				OutputFormat: stringPtr("both"),
-			})
-			require.NoError(t, err)
-			require.Len(t, result.Content, 2)
-
-			img := result.Content[0].(mcp.ImageContent)
-			assert.Equal(t, tt.wantMIME, img.MIMEType)
-
-			res := result.Content[1].(mcp.EmbeddedResource)
-			blob := res.Resource.(mcp.BlobResourceContents)
-			assert.Equal(t, tt.wantMIME, blob.MIMEType)
-		})
-	}
-}
-
-// TestGetPanelImage_ResponseTooLarge covers the OOM guard. Without it, a
-// misbehaving upstream that streams multi-GB data would crash the server;
-// with it, we refuse to buffer beyond renderResponseLimitBytes and return
-// a structured error instead. The handler streams the oversize body in
-// small chunks rather than allocating a 25MiB buffer in the test process —
-// the client-side LimitReader stops consuming well before the handler
-// finishes writing, so only a small prefix is actually transferred.
-func TestGetPanelImage_ResponseTooLarge(t *testing.T) {
-	const chunkSize = 64 * 1024
-	chunk := bytes.Repeat([]byte{0x89}, chunkSize)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "image/png")
-		w.WriteHeader(http.StatusOK)
-		remaining := renderResponseLimitBytes + 1
-		for remaining > 0 {
-			n := chunkSize
-			if remaining < n {
-				n = remaining
-			}
-			if _, err := w.Write(chunk[:n]); err != nil {
-				// Client closed the connection — that's the
-				// expected path once LimitReader has its bytes.
-				return
-			}
-			remaining -= n
-		}
-	}))
-	defer server.Close()
-
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
-		URL:    server.URL,
-		APIKey: "test-api-key",
-	})
-
-	_, err := getPanelImage(ctx, GetPanelImageParams{DashboardUID: "test-dash"})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "exceeded")
-}
-
-// TestGetPanelImage_ErrorBodyBounded verifies the non-200 error path also
-// respects renderResponseLimitBytes. A hostile upstream could otherwise
-// stream a huge 5xx body to OOM us while we try to include it in the
-// error message. Body is streamed in chunks to keep test memory low.
-func TestGetPanelImage_ErrorBodyBounded(t *testing.T) {
-	const chunkSize = 64 * 1024
-	chunk := bytes.Repeat([]byte{'x'}, chunkSize)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		remaining := renderResponseLimitBytes + 1024
-		for remaining > 0 {
-			n := chunkSize
-			if remaining < n {
-				n = remaining
-			}
-			if _, err := w.Write(chunk[:n]); err != nil {
-				return
-			}
-			remaining -= n
-		}
-	}))
-	defer server.Close()
-
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
-		URL:    server.URL,
-		APIKey: "test-api-key",
-	})
-
-	_, err := getPanelImage(ctx, GetPanelImageParams{DashboardUID: "test-dash"})
-	require.Error(t, err)
-	// The error must carry the HTTP code but NOT the raw (potentially
-	// multi-megabyte) body — instead, surface the overflow explicitly.
-	assert.Contains(t, err.Error(), "HTTP 500")
-	assert.Contains(t, err.Error(), "exceeded")
-	assert.NotContains(t, err.Error(), strings.Repeat("x", 1024),
-		"oversize error bodies must not leak into the error message")
-}
-
-// TestGetPanelImage_EmptyBody covers the 200-OK-with-zero-bytes case. A
-// misconfigured image-renderer or a flaky proxy can produce this; we must
-// not silently return an empty-base64 ImageContent because downstream
-// hooks would then write a zero-byte file and treat the render as
-// successful.
-func TestGetPanelImage_EmptyBody(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "image/png")
-		w.WriteHeader(http.StatusOK)
-		// no body
-	}))
-	defer server.Close()
-
-	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
-		URL:    server.URL,
-		APIKey: "test-api-key",
-	})
-
-	_, err := getPanelImage(ctx, GetPanelImageParams{DashboardUID: "test-dash"})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "empty image body")
-}
-
-// TestParseImageMIME covers the MIME-header normalization function directly,
-// including the cases that would otherwise require spinning up httptest
-// servers to exercise.
-func TestParseImageMIME(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{name: "empty", in: "", want: "image/png"},
-		{name: "plain png", in: "image/png", want: "image/png"},
-		{name: "plain jpeg", in: "image/jpeg", want: "image/jpeg"},
-		{name: "png with charset", in: "image/png; charset=utf-8", want: "image/png"},
-		{name: "mixed case with params", in: "IMAGE/PNG; Boundary=X", want: "image/png"},
-		{name: "non-image", in: "text/html", want: "image/png"},
-		{name: "garbled", in: "image/;;", want: "image/png"},
-		{name: "application/octet-stream", in: "application/octet-stream", want: "image/png"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, parseImageMIME(tt.in))
-		})
-	}
-}
-
-// TestGetPanelImageParams_UnmarshalOutputFormat locks in the JSON contract
-// that callers (skills, hooks, integration tests) rely on.
-func TestGetPanelImageParams_UnmarshalOutputFormat(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  *string
-	}{
-		{name: "omitted", input: `{"dashboardUid":"x"}`, want: nil},
-		{name: "null", input: `{"dashboardUid":"x","outputFormat":null}`, want: nil},
-		{name: "image", input: `{"dashboardUid":"x","outputFormat":"image"}`, want: stringPtr("image")},
-		{name: "resource", input: `{"dashboardUid":"x","outputFormat":"resource"}`, want: stringPtr("resource")},
-		{name: "both", input: `{"dashboardUid":"x","outputFormat":"both"}`, want: stringPtr("both")},
-		{name: "text_base64", input: `{"dashboardUid":"x","outputFormat":"text_base64"}`, want: stringPtr("text_base64")},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var params GetPanelImageParams
-			require.NoError(t, json.Unmarshal([]byte(tt.input), &params))
-			if tt.want == nil {
-				assert.Nil(t, params.OutputFormat)
-				return
-			}
-			require.NotNil(t, params.OutputFormat)
-			assert.Equal(t, *tt.want, *params.OutputFormat)
-		})
-	}
+	assert.True(t, strings.HasPrefix(link, "http://grafana.example/explore?"), link)
+	assert.Contains(t, link, "panes=")
 }

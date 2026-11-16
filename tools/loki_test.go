@@ -19,6 +19,17 @@ func TestLokiTools(t *testing.T) {
 		assert.NotEmpty(t, result, "Should have at least one label name")
 	})
 
+	t.Run("list loki label names with relative time range", func(t *testing.T) {
+		ctx := newTestContext()
+		result, err := listLokiLabelNames(ctx, ListLokiLabelNamesParams{
+			DatasourceUID: "loki",
+			StartRFC3339:  "now-1h",
+			EndRFC3339:    "now",
+		})
+		require.NoError(t, err)
+		assert.NotEmpty(t, result, "Should have at least one label name")
+	})
+
 	t.Run("get loki label values", func(t *testing.T) {
 		ctx := newTestContext()
 		result, err := listLokiLabelValues(ctx, ListLokiLabelValuesParams{
@@ -27,6 +38,21 @@ func TestLokiTools(t *testing.T) {
 		})
 		require.NoError(t, err)
 		assert.NotEmpty(t, result, "Should have at least one container label value")
+	})
+
+	t.Run("get loki label values narrowed by matcher", func(t *testing.T) {
+		ctx := newTestContext()
+		// A regex, not an exact match: promtail's docker_sd_configs derives
+		// the "container" label from the running container's actual name
+		// (testdata/promtail-config.yml), which Docker Compose generates as
+		// "<project>-grafana-<n>" rather than the bare service name "grafana".
+		result, err := listLokiLabelValues(ctx, ListLokiLabelValuesParams{
+			DatasourceUID: "loki",
+			LabelName:     "container",
+			Matcher:       `{container=~".*grafana.*"}`,
+		})
+		require.NoError(t, err)
+		assert.NotEmpty(t, result, "Should have at least one container label value matching the selector")
 	})
 
 	t.Run("query loki stats", func(t *testing.T) {
@@ -43,7 +69,7 @@ func TestLokiTools(t *testing.T) {
 		assert.GreaterOrEqual(t, result.Streams, 0, "Should have a valid streams count")
 		assert.GreaterOrEqual(t, result.Chunks, 0, "Should have a valid chunks count")
 		assert.GreaterOrEqual(t, result.Entries, 0, "Should have a valid entries count")
-		assert.GreaterOrEqual(t, result.Bytes, 0, "Should have a valid bytes count")
+		assert.GreaterOrEqual(t, result.Bytes, int64(0), "Should have a valid bytes count")
 	})
 
 	t.Run("query loki logs", func(t *testing.T) {
@@ -62,6 +88,47 @@ func TestLokiTools(t *testing.T) {
 			assert.NotEmpty(t, entry.Timestamp, "Log entry should have a timestamp")
 			assert.NotNil(t, entry.Labels, "Log entry should have labels")
 		}
+	})
+
+	t.Run("query loki logs compact format", func(t *testing.T) {
+		ctx := newTestContext()
+		// "Compact" (mixed case + trailing space) must normalise to "compact".
+		result, err := queryLokiLogs(ctx, QueryLokiLogsParams{
+			DatasourceUID: "loki",
+			LogQL:         `{container=~".+"}`,
+			Limit:         10,
+			Format:        "Compact ",
+		})
+		require.NoError(t, err)
+		require.NotNil(t, result, "Result should not be nil")
+
+		// Compact keeps data as an empty (non-nil) array and moves lines into streams.
+		assert.NotNil(t, result.Data, "Data should be a non-nil array in compact mode")
+		assert.Empty(t, result.Data, "Data should be empty in compact mode")
+
+		totalLines := 0
+		for _, stream := range result.Streams {
+			assert.NotNil(t, stream.Labels, "Compact stream should carry labels")
+			for _, line := range stream.Lines {
+				assert.NotEmpty(t, line.Timestamp, "Compact line should have a timestamp")
+				totalLines++
+			}
+		}
+		if result.Metadata != nil {
+			assert.Equal(t, result.Metadata.LinesReturned, totalLines,
+				"Compact stream lines should account for every returned line")
+		}
+	})
+
+	t.Run("query loki logs rejects invalid format", func(t *testing.T) {
+		ctx := newTestContext()
+		_, err := queryLokiLogs(ctx, QueryLokiLogsParams{
+			DatasourceUID: "loki",
+			LogQL:         `{container=~".+"}`,
+			Format:        "not-a-format",
+		})
+		require.Error(t, err, "Unknown format should be rejected")
+		assert.Contains(t, err.Error(), "invalid format")
 	})
 
 	t.Run("query loki logs with no results", func(t *testing.T) {

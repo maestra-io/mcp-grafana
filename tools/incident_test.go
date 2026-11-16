@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/grafana/incident-go"
-	mcpgrafana "github.com/grafana/mcp-grafana"
+	mcpgrafana "github.com/grafana/mcp-grafana/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -26,6 +26,9 @@ func TestIncidentTools(t *testing.T) {
 		})
 		require.NoError(t, err)
 		assert.Len(t, result.Incidents, 2)
+		for _, i := range result.Incidents {
+			assert.Nil(t, i.CustomFields, "custom fields should be omitted unless requested")
+		}
 	})
 
 	t.Run("create incident", func(t *testing.T) {
@@ -44,6 +47,39 @@ func TestIncidentTools(t *testing.T) {
 		assert.Equal(t, "minor", result.Severity)
 		assert.True(t, result.IsDrill)
 		assert.Equal(t, "active", result.Status)
+		assert.Nil(t, result.CustomFields, "custom fields should be omitted when none were set")
+	})
+
+	t.Run("update incident", func(t *testing.T) {
+		ctx := newIncidentTestContext()
+		result, err := updateIncident(ctx, UpdateIncidentParams{
+			IncidentID: "incident-123",
+			Status:     "resolved",
+			Severity:   "major",
+			Title:      "high latency in web requests",
+		})
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Equal(t, "incident-123", result.IncidentID)
+		assert.Nil(t, result.CustomFields, "custom fields should be omitted when none were set")
+	})
+
+	t.Run("update incident requires an incident ID", func(t *testing.T) {
+		ctx := newIncidentTestContext()
+		_, err := updateIncident(ctx, UpdateIncidentParams{
+			Status: "resolved",
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "incidentId is required")
+	})
+
+	t.Run("update incident requires at least one field", func(t *testing.T) {
+		ctx := newIncidentTestContext()
+		_, err := updateIncident(ctx, UpdateIncidentParams{
+			IncidentID: "incident-123",
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "at least one of status, severity, title or customFields")
 	})
 
 	t.Run("add activity to incident", func(t *testing.T) {
@@ -57,4 +93,22 @@ func TestIncidentTools(t *testing.T) {
 		assert.Equal(t, "The incident was created by user-123", result.Body)
 		assert.Equal(t, "2021-08-07T11:58:23Z", result.EventTime)
 	})
+}
+
+func TestNewIncidentResultDropsPlaceholderAssignments(t *testing.T) {
+	commander := incident.Assignment{RoleID: 7, User: incident.UserPreview{UserID: "grafana-incident:user-1"}}
+	inc := &incident.Incident{IncidentMembership: incident.IncidentMembership{
+		// The Incident API pads assignments to 10 entries with zero values.
+		Assignments:      []incident.Assignment{commander, {}, {}, {}, {}, {}, {}, {}, {}, {}},
+		TotalAssignments: 1,
+	}}
+	result, err := newIncidentResult(context.Background(), nil, inc, false)
+	require.NoError(t, err)
+	assert.Equal(t, []incident.Assignment{commander}, result.IncidentMembership.Assignments)
+
+	empty := &incident.Incident{IncidentMembership: incident.IncidentMembership{Assignments: make([]incident.Assignment, 10)}}
+	result, err = newIncidentResult(context.Background(), nil, empty, false)
+	require.NoError(t, err)
+	assert.Empty(t, result.IncidentMembership.Assignments)
+	assert.NotNil(t, result.IncidentMembership.Assignments, "should serialize as [] rather than null")
 }

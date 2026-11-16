@@ -13,7 +13,7 @@ import (
 
 // TestKubernetesClient_Update asserts PUT method, escaped path, request body
 // passthrough, and decoded response.
-func TestKubernetesClient_Update(t *testing.T) {
+func TestKubernetesClient_MutateUpdate(t *testing.T) {
 	var gotMethod, gotPath, gotBody string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
@@ -49,7 +49,7 @@ func TestKubernetesClient_Update(t *testing.T) {
 
 // TestKubernetesClient_Create asserts POST method, collection path, request
 // body passthrough, and decoded response.
-func TestKubernetesClient_Create(t *testing.T) {
+func TestKubernetesClient_MutateCreate(t *testing.T) {
 	var gotMethod, gotPath, gotBody string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
