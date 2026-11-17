@@ -178,6 +178,6 @@ jobs:
           digest: ${{ steps.push.outputs.digest }}
 
       - name: Create GitHub release
-        uses: maestra-io/github-actions/create-github-release@df704636a89df5ddddc1ba836f8b09c796456ed7 # v1.49.0
+        uses: maestra-io/github-actions/create-github-release@44017564ae3576fc8ccb3b23d0ed005bc5d5d073 # v1.102.0
         with:
           release-number: ${{ steps.release-number.outputs.release-number }}
