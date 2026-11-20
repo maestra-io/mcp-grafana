@@ -36,7 +36,7 @@ LABEL io.modelcontextprotocol.server.name="io.github.grafana/mcp-grafana"
 # on the next build.
 ARG BASE_REFRESH
 RUN --mount=type=secret,id=PRIVATE_PACKAGES_TOKEN,required=true \
-    --mount=type=bind,from=public.ecr.aws/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
+    --mount=type=bind,from=packages.maestra.io/ecr-public/g5f9s8a4/nora-apt:1.0.0@sha256:cd5fcec38f8b7c4fdd283d41f49ac656751d4deed168111f89f44976a43a8178,target=/nora-apt,rw \
     . /nora-apt/env.sh && apt-get update && apt-get upgrade -y && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user
