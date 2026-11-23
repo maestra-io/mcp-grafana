@@ -1,5 +1,5 @@
 # Build stage
-FROM --platform=$BUILDPLATFORM packages.maestra.io/docker-hub/library/golang:1.26-bookworm@sha256:5de7c99eb78ca5e515a4c340235d0955ec5964a5071c492c15503d7c267da473 AS builder
+FROM --platform=$BUILDPLATFORM packages.maestra.io/docker-hub/library/golang:1.26-trixie@sha256:cff05dd6b81c901f2e8249eb6f91c69a60451d0f12c26bfef08e476a85b32d4d AS builder
 
 # Set the working directory
 WORKDIR /app
@@ -25,7 +25,7 @@ ARG VERSION=""
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags="-s -w -X github.com/grafana/mcp-grafana/v2.version=${VERSION}" -o mcp-grafana ./cmd/mcp-grafana
 
 # Final stage
-FROM packages.maestra.io/docker-hub/library/debian:bookworm-slim@sha256:67b30a61dc87758f0caf819646104f29ecbda97d920aaf5edc834128ac8493d3
+FROM packages.maestra.io/docker-hub/library/debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 LABEL io.modelcontextprotocol.server.name="io.github.grafana/mcp-grafana"
 
