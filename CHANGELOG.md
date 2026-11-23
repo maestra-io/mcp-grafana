@@ -11,6 +11,7 @@ Merged upstream v2.3.0 into the fork. Fork features kept on top of upstream:
 
 ### Changed
 
+- The container image runs on Debian 13 (trixie): `debian:trixie-slim` runtime, `golang:1.26-trixie` builder (issues-maestra#1810).
 - Tool arguments a tool does not declare (for example `reason`, of any shape) are ignored instead of rejected, and input schemas no longer advertise `additionalProperties: false`. Upstream rejects them with `unknown argument`; ignored keys are recorded on the span (`mcp.tool.ignored_arguments`) and logged at debug level.
 - `sql` is in the default `enabled-tools` list, so ClickHouse datasources are queryable without a custom flag (fork default since 1.0.x). `query_clickhouse`, `list_clickhouse_tables` and `describe_clickhouse_table` remain as aliases of the SQL tools.
 - `get_tempo_trace` accepts both upstream parameters (`datasourceUid`, `start`, `end`, `focus_span_id`) and the fork's (`data_source_uid`, `start_rfc_3339`, `end_rfc_3339`); the fork's select the Tempo HTTP API path that returns OTLP-JSON and works for VictoriaTraces.
