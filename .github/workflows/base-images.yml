@@ -1,0 +1,16 @@
+# No new image nora still holds in its 3-day quarantine, in a Dockerfile, compose file,
+# workflow or manifest (maestra-io/github-actions base-images.yml, issues-maestra#1649).
+# It judges only images the PR adds. Check name: `base-images / base images`.
+name: base-images
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  base-images:
+    uses: maestra-io/github-actions/.github/workflows/base-images.yml@main
+    permissions:
+      contents: read
+      id-token: write # nora session token
