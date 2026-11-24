@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write # setup-mise: tools from GitHub Releases through nora
 
 jobs:
   lint-jsonschema:
