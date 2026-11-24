@@ -9,7 +9,10 @@ on:
 
 permissions:
   contents: read
-  id-token: write # setup-mise: tools from GitHub Releases through nora
+  # setup-mise takes its tools through nora only (3-day hold, issues-maestra#1649). A fork PR gets no OIDC
+  # token, so these jobs fail there on purpose: no unheld download as a fallback. To check a fork's
+  # change, push it to a branch of this repository.
+  id-token: write
 
 jobs:
   lint-jsonschema:
