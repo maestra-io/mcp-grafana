@@ -52,7 +52,11 @@ runs:
         cache_key_prefix: mise-nora-v1
       env:
         MISE_NETRC_FILE: ${{ runner.temp }}/mise-netrc
-        MISE_URL_REPLACEMENTS: '{"regex:^https://github[.]com/([^/]+/[^/]+/releases/download/.+)$": "https://packages.maestra.io/github/$1"}'
+        # The second rule turns mise's fallback to the GitHub API asset (mise.lock url_api) into a 404:
+        # an asset nora refuses must fail the job, not come from GitHub.
+        MISE_URL_REPLACEMENTS: >-
+          {"regex:^https://github[.]com/([^/]+/[^/]+/releases/download/.+)$": "https://packages.maestra.io/github/$1",
+          "regex:^https://api[.]github[.]com/repos/[^/]+/[^/]+/releases/assets/.+$": "https://packages.maestra.io/github/no-api-fallback"}
 
     # mise-action exports the job's token to every later step. Those steps run
     # PR code (go test, the built binary), and the tools are installed by now.
