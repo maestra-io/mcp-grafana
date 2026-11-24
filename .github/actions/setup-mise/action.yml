@@ -1,5 +1,7 @@
 name: Set up mise
-description: Install the tools pinned in mise.toml at the digests recorded in mise.lock, and cache them along with Go, npm and uv downloads.
+description: >-
+  Install the tools pinned in mise.toml at the digests recorded in mise.lock, and cache them along with
+  Go, npm and uv downloads. The job needs `id-token: write`: GitHub Releases assets come through nora.
 
 inputs:
   cache:
@@ -14,6 +16,27 @@ inputs:
 runs:
   using: composite
   steps:
+    # mise and the tools it takes from GitHub Releases come through nora (packages.maestra.io, 3-day
+    # hold, issues-maestra#1649). Bump the version here, its sha256 and `version` below together.
+    - name: mise through nora
+      id: mise
+      uses: maestra-io/github-actions/nora-asset@a4ecbf696bc63094df4bbe9378bdf8fd170839e9 # v1.115.5
+      with:
+        path: github/jdx/mise/releases/download/v2026.9.5/mise-v2026.9.5-linux-x64
+        sha256: 32f644d8c291bb182f702c6d2b0dda9f8b01441e940d74d328aad5f08446b2fd
+    - name: nora session token
+      id: nora
+      uses: maestra-io/github-actions/nora-session@a4ecbf696bc63094df4bbe9378bdf8fd170839e9 # v1.115.5
+    # mise-action keeps a mise it finds here; mise sends the netrc login after a URL replacement.
+    - name: Place mise and its nora login
+      shell: bash
+      env:
+        MISE: ${{ steps.mise.outputs.file }}
+        TOKEN: ${{ steps.nora.outputs.token }}
+      run: |
+        install -D -m 0755 "$MISE" "$HOME/.local/share/mise/bin/mise"
+        (umask 077; printf 'machine packages.maestra.io login token password %s\n' "$TOKEN" > "$RUNNER_TEMP/mise-netrc")
+
     # --locked installs only the URLs and checksums committed in mise.lock, so
     # a re-published release asset cannot replace a reviewed binary. mise-action
     # adds it whenever a lockfile exists; passing it here makes a missing
@@ -25,12 +48,23 @@ runs:
         install: true
         install_args: --locked ${{ inputs.tools }}
         cache: ${{ inputs.cache == 'true' }}
+        # not the tools cached before nora
+        cache_key_prefix: mise-nora-v1
+      env:
+        MISE_NETRC_FILE: ${{ runner.temp }}/mise-netrc
+        # The second rule turns mise's fallback to the GitHub API asset (mise.lock url_api) into a 404:
+        # an asset nora refuses must fail the job, not come from GitHub.
+        MISE_URL_REPLACEMENTS: >-
+          {"regex:^https://github[.]com/([^/]+/[^/]+/releases/download/.+)$": "https://packages.maestra.io/github/$1",
+          "regex:^https://api[.]github[.]com/repos/[^/]+/[^/]+/releases/assets/.+$": "https://packages.maestra.io/github/no-api-fallback"}
 
     # mise-action exports the job's token to every later step. Those steps run
     # PR code (go test, the built binary), and the tools are installed by now.
-    - name: Drop the GitHub token from the environment
+    - name: Drop the GitHub token from the environment, and the nora login
       shell: bash
-      run: echo "MISE_GITHUB_TOKEN=" >> "$GITHUB_ENV"
+      run: |
+        echo "MISE_GITHUB_TOKEN=" >> "$GITHUB_ENV"
+        rm -f "$RUNNER_TEMP/mise-netrc"
 
     # mise-action caches the tools only, so this replaces the setup-go, setup-node
     # and setup-uv caches. Keyed per job: a shared key would be saved first by the
